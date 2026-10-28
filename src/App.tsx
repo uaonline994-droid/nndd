@@ -19,7 +19,7 @@ type CrmError = { id: string; fingerprint: string; title: string; area: string; 
 type Announcement = { id: string; title: string; body: string; status: string; updatedAt?: number };
 type StaffMember = { id: string; email: string; displayName?: string; role: Role };
 type AuditEntry = { id: string; actorUid: string; action: string; payload: Record<string, unknown>; at?: number };
-type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ date?: string; activePlayers?: number; events?: number }> };
+type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> };
 
 const founderEmail = "a60840397@gmail.com";
 const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
