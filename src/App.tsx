@@ -6,7 +6,11 @@ import {
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
-  auth, beginGoogleSignIn, call, enrollPhoneMfa, isSecondFactorSession, multiFactor,
+  collection, doc, getCountFromServer, getDoc, getDocs, limit, orderBy, query,
+  where, type QueryConstraint,
+} from "firebase/firestore";
+import {
+  auth, beginGoogleSignIn, call, db, enrollPhoneMfa, isSecondFactorSession, multiFactor,
   RecaptchaVerifier, signOut,
 } from "./firebase";
 
@@ -38,10 +42,38 @@ function dateLabel(value?: number) {
 
 function errorText(error: unknown) {
   if (typeof error === "object" && error && "code" in error && error.code === "functions/internal") {
-    return "Cloud Function whoAmI вернула INTERNAL. В Firebase Console откройте Functions → whoAmI → Logs и проверьте запись CRM whoAmI lookup failed.";
+    return "Cloud Function вернула INTERNAL. В Firebase Console откройте логи функции, вызванной этой операцией.";
   }
   if (typeof error === "object" && error && "message" in error) return String(error.message).replace(/^Firebase: /, "");
   return "Не удалось выполнить операцию.";
+}
+
+function timestampMillis(value: unknown): number | undefined {
+  if (typeof value === "number") return value;
+  if (value && typeof value === "object" && "toMillis" in value && typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+  return undefined;
+}
+
+function firestoreRow<T extends { id: string }>(id: string, data: Record<string, unknown>): T {
+  return {
+    ...data,
+    id,
+    createdAt: timestampMillis(data.createdAt),
+    expiresAt: timestampMillis(data.expiresAt),
+    lastSeenAt: timestampMillis(data.lastSeenAt),
+    activatedAt: timestampMillis(data.activatedAt),
+    updatedAt: timestampMillis(data.updatedAt),
+    publishedAt: timestampMillis(data.publishedAt),
+    firstSeenAt: timestampMillis(data.firstSeenAt),
+    at: timestampMillis(data.at),
+  } as T;
+}
+
+async function readRows<T extends { id: string }>(path: string, ...constraints: QueryConstraint[]): Promise<T[]> {
+  const result = await getDocs(query(collection(db, path), ...constraints));
+  return result.docs.map((item) => firestoreRow<T>(item.id, item.data()));
 }
 
 export default function App() {
@@ -88,23 +120,21 @@ export default function App() {
     setLoading(true);
     if (!currentUser) { setLoading(false); return; }
     try {
-      const identity = await call<{
-        role?: Role;
-        email?: string;
-        staffStatus?: string;
-        staffEmail?: string | null;
-        staffRole?: string | null;
-      }>("whoAmI");
-      setRole(identity.role ?? null);
-      setAccessDiagnostic(identity.staffStatus === "missing_document"
-        ? `Functions не нашли документ staff/${currentUser.uid}. Проверьте проект и ID документа.`
-        : identity.staffStatus === "invalid_role"
-          ? `Документ найден, но роль «${identity.staffRole || "пустая"}» недопустима. Разрешены owner, support, marketing.`
-          : identity.staffStatus === "email_mismatch"
-            ? `Email в токене (${identity.email || "нет"}) не совпадает с email в staff-документе (${identity.staffEmail || "нет"}).`
-            : identity.staffStatus === "active"
-              ? "Роль распознана, но CRM не открылась. Проверьте MFA и повторно войдите в аккаунт."
-              : "Functions вернули старый формат ответа. Разверните обновлённые Cloud Functions и обновите CRM.");
+      const staffSnapshot = await getDoc(doc(db, "staff", currentUser.uid));
+      const staffData = staffSnapshot.exists() ? staffSnapshot.data() : null;
+      const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
+      const staffEmail = String(staffData?.email || "").trim().toLowerCase();
+      const roleValue = staffData?.role;
+      const roleValid = roleValue === "owner" || roleValue === "support" || roleValue === "marketing";
+      const role = roleValid && staffEmail === tokenEmail ? roleValue as Role : null;
+      setRole(role);
+      setAccessDiagnostic(!staffSnapshot.exists
+        ? `Не найден документ staff/${currentUser.uid} в выбранном Firebase-проекте.`
+        : !roleValid
+          ? `Документ найден, но роль «${String(roleValue || "пустая")}» недопустима. Разрешены owner, support, marketing.`
+          : staffEmail !== tokenEmail
+            ? `Email Google (${currentUser.email || "нет"}) не совпадает с email в Firestore (${String(staffData?.email || "нет")}).`
+            : "Роль найдена. Если вход всё ещё закрыт, включите и подтвердите MFA, затем войдите снова.");
       setSecondFactor(await isSecondFactorSession(currentUser));
     } catch (cause) {
       setError(errorText(cause));
@@ -123,21 +153,26 @@ export default function App() {
     setError("");
     try {
       if (target === "overview" || target === "analytics") {
-        const data = await call<Overview>("getCrmOverview");
-        setOverview(data);
-        setCampaigns(data.campaigns ?? []);
-        setErrors(data.errors ?? []);
+        const [playerCount, campaignRows, errorRows, dailyRows] = await Promise.all([
+          role === "marketing" ? Promise.resolve(0) : getCountFromServer(collection(db, "players")).then((count) => count.data().count),
+          role === "marketing" ? Promise.resolve([] as Campaign[]) : readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)),
+          role === "marketing" ? Promise.resolve([] as CrmError[]) : readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(20)),
+          readRows<{ id: string; date?: string; activePlayers?: number; events?: number }>("dailyAnalytics", orderBy("date", "desc"), limit(30)),
+        ]);
+        setOverview({ playerCount, campaigns: campaignRows, errors: errorRows, daily: dailyRows });
+        setCampaigns(campaignRows);
+        setErrors(errorRows);
       }
       if (target === "zbt") {
-        const [campaignData] = await Promise.all([call<{ campaigns: Campaign[] }>("listZbtCampaigns")]);
-        setCampaigns(campaignData.campaigns);
+        const campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50));
+        setCampaigns(campaignRows);
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
-      if (target === "players") setPlayers((await call<{ players: Player[] }>("listPlayers")).players);
-      if (target === "errors") setErrors((await call<{ errors: CrmError[] }>("listErrorGroups")).errors);
-      if (target === "news") setAnnouncements((await call<{ announcements: Announcement[] }>("listAnnouncements")).announcements);
-      if (target === "staff") setStaff((await call<{ staff: StaffMember[] }>("listStaff")).staff);
-      if (target === "audit") setAudit((await call<{ entries: AuditEntry[] }>("listAuditLog")).entries);
+      if (target === "players") setPlayers(await readRows<Player>("players", orderBy("lastSeenAt", "desc"), limit(200)));
+      if (target === "errors") setErrors(await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100)));
+      if (target === "news") setAnnouncements(await readRows<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100)));
+      if (target === "staff") setStaff(await readRows<StaffMember>("staff", orderBy("email", "asc")));
+      if (target === "audit") setAudit(await readRows<AuditEntry>("auditLog", orderBy("at", "desc"), limit(200)));
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -147,7 +182,7 @@ export default function App() {
 
   async function loadKeys(campaignId: string) {
     setSelectedCampaign(campaignId);
-    setKeys((await call<{ keys: ZbtKey[] }>("listZbtKeys", { campaignId })).keys);
+    setKeys(await readRows<ZbtKey>("zbtKeys", where("campaignId", "==", campaignId), limit(500)));
   }
 
   async function signIn() {
