@@ -3,16 +3,12 @@ import {
   Activity, AlertTriangle, Ban, Check, ChevronDown, CircleHelp,
   Clock3, FileText, KeyRound, LayoutDashboard, LogOut, Mail, Menu, Plus, RefreshCw,
   Search, ShieldCheck, ShieldAlert, Users, X, Download, Database, Copy, CheckCheck,
-  Server, Lock, Sparkles, Filter
+  Server, Lock, Sparkles, Filter, ExternalLink, UploadCloud
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
-  collection, doc, getCountFromServer, getDoc, getDocs, limit, orderBy, query,
-  setDoc, updateDoc, where, type QueryConstraint
-} from "firebase/firestore";
-import {
   auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove,
-  rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_URL,
+  rtdbTestAccess, RECOMMENDED_RTDB_RULES, DEV_TEST_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
   enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
 } from "./firebase";
 
@@ -20,7 +16,7 @@ type Role = "owner" | "support" | "marketing";
 type Page = "overview" | "zbt" | "players" | "errors" | "news" | "staff" | "analytics" | "audit";
 type Campaign = { id: string; name: string; seats: number; status: string; activatedCount: number; createdAt?: number; expiresAt?: number | null };
 type Player = { uid: string; nickname: string; contactEmail: string; status: string; zbtCampaignId?: string; lastSeenAt?: number };
-type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; nickname?: string; installId?: string; activatedAt?: number };
+type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; nickname?: string; installId?: string; activatedAt?: number; rawKey?: string; createdAt?: number };
 type CrmError = { id: string; fingerprint: string; title: string; area: string; status: string; occurrences: number; affectedPlayers: number; updatedAt?: number; version?: string };
 type Announcement = { id: string; title: string; body: string; status: string; updatedAt?: number; author?: string };
 type StaffMember = { id: string; email: string; displayName?: string; role: Role; isChief?: boolean; createdAt?: number; invitedBy?: string };
@@ -133,6 +129,8 @@ export default function App() {
     message: "",
   });
   const [copiedRules, setCopiedRules] = useState(false);
+  const [rulesTab, setRulesTab] = useState<"dev" | "prod">("dev");
+  const [copiedKey, setCopiedKey] = useState("");
 
   // Authentication observer
   useEffect(() => {
@@ -178,7 +176,7 @@ export default function App() {
           return prev;
         });
 
-        // Background write to RTDB
+        // Background write to RTDB & auto-diagnostics
         void (async () => {
           await rtdbSet(`staff/${currentUser.uid}`, {
             email: tokenEmail,
@@ -188,6 +186,7 @@ export default function App() {
             updatedAt: Date.now(),
           });
           await rtdbSet("admin", tokenEmail);
+          await runRtdbDiagnostics();
         })();
 
         return;
@@ -375,13 +374,20 @@ export default function App() {
     setSelectedCampaign(campaignId);
     try {
       const rtdbKeys = await rtdbGet<Record<string, ZbtKey>>("zbtKeys").catch(() => null);
-      if (rtdbKeys) {
+      if (rtdbKeys && Object.keys(rtdbKeys).length > 0) {
         const list = Object.entries(rtdbKeys)
           .map(([id, val]) => ({ ...val, id }))
           .filter((k) => k.campaignId === campaignId);
-        setKeys(list);
-        saveLocal("keys", list);
+        if (list.length > 0) {
+          setKeys(list);
+          saveLocal("keys", list);
+          return;
+        }
       }
+      // Fallback to locally saved keys for this campaign
+      const localKeys = loadLocal<ZbtKey[]>("keys", []);
+      const filtered = localKeys.filter((k) => k.campaignId === campaignId);
+      setKeys(filtered);
     } catch (cause) {
       console.warn("Error loading keys:", cause);
     }
@@ -513,6 +519,7 @@ export default function App() {
   async function createCampaign(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
+    setError("");
 
     const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
     const campaignId = `zbt_${Date.now()}`;
@@ -537,12 +544,30 @@ export default function App() {
       expiresAt: expiresAtMs,
     };
 
-    // 1. Optimistic UI update
+    const newKeysList: ZbtKey[] = generatedKeys.map((rawKey) => {
+      const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
+      return {
+        id: keyHash,
+        campaignId,
+        status: "UNUSED",
+        rawKey,
+        createdAt: Date.now(),
+      };
+    });
+
+    // 1. Local state & storage update so keys are never lost
     setCampaigns((prev) => {
       const updated = [campaignPayload, ...prev];
       saveLocal("campaigns", updated);
       return updated;
     });
+
+    setKeys((prev) => {
+      const updated = [...newKeysList, ...prev];
+      saveLocal("keys", updated);
+      return updated;
+    });
+    setSelectedCampaign(campaignId);
 
     // 2. Download CSV immediately
     const csvContent = "index,key,campaign,status\n" + generatedKeys.map((k, idx) => `${idx + 1},${k},${campaignName},UNUSED`).join("\n");
@@ -553,24 +578,108 @@ export default function App() {
     link.click();
     URL.revokeObjectURL(link.href);
 
-    setNotice("Кампания ЗБТ создана! CSV-файл с открытыми ключами скачан.");
-    setCampaignName("");
-    setShowCampaignForm(false);
+    // 3. Prepare Realtime Database batches
+    const rtdbKeyBatch: Record<string, unknown> = {};
+    const rtdbFlatKeyBatch: Record<string, unknown> = {};
+    for (const k of newKeysList) {
+      rtdbKeyBatch[k.id] = k;
+      if (k.rawKey) {
+        rtdbFlatKeyBatch[k.rawKey] = {
+          campaignId,
+          campaignName,
+          status: "UNUSED",
+          createdAt: Date.now(),
+          rawKey: k.rawKey,
+        };
+      }
+    }
+
+    // 4. Await RTDB writes and verify responses
+    const campWrite = await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
+    await rtdbSet(`campaigns/${campaignId}`, campaignPayload);
+    const keysWrite = await rtdbUpdate("zbtKeys", rtdbKeyBatch);
+    const flatKeysWrite = await rtdbUpdate("keys", rtdbFlatKeyBatch);
+
     setBusy(false);
 
-    // 3. Async RTDB write
-    await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
-    const rtdbKeyBatch: Record<string, unknown> = {};
-    for (const rawKey of generatedKeys) {
-      const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
-      rtdbKeyBatch[keyHash] = {
-        campaignId,
-        status: "UNUSED",
-        rawKey,
-        createdAt: Date.now(),
-      };
+    if (campWrite.success && keysWrite.success) {
+      setNotice(`✅ Кампания «${campaignName}» и ${campaignSeats} ключей успешно записаны в Realtime Database (/zbtCampaigns, /zbtKeys, /keys)!`);
+      setCampaignName("");
+      setShowCampaignForm(false);
+    } else {
+      const writeErr = campWrite.error || keysWrite.error || flatKeysWrite.error || "PERMISSION_DENIED";
+      setError(
+        `⚠️ Realtime Database отклонила запись (${writeErr}). В консоли Firebase в разделе Rules включите правила доступа! Ключи сохранены в браузере и CSV.`
+      );
+      setShowDbModal(true);
     }
-    await rtdbUpdate("zbtKeys", rtdbKeyBatch);
+  }
+
+  // Bulk sync all local campaigns & keys into Realtime Database
+  async function syncAllToRtdb() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+
+    try {
+      const localCampaigns = loadLocal<Campaign[]>("campaigns", campaigns);
+      const localKeys = loadLocal<ZbtKey[]>("keys", keys);
+
+      let campCount = 0;
+      let lastErr = "";
+
+      for (const camp of localCampaigns) {
+        const res = await rtdbSet(`zbtCampaigns/${camp.id}`, camp);
+        await rtdbSet(`campaigns/${camp.id}`, camp);
+        if (res.success) {
+          campCount++;
+        } else {
+          lastErr = res.error || "PERMISSION_DENIED";
+        }
+      }
+
+      if (localKeys.length > 0) {
+        const keyBatch: Record<string, unknown> = {};
+        const flatBatch: Record<string, unknown> = {};
+        for (const k of localKeys) {
+          const raw = k.rawKey || k.id;
+          const keyHash = `hash_${raw.replace(/[^A-Za-z0-9]/g, "")}`;
+          keyBatch[keyHash] = {
+            id: keyHash,
+            campaignId: k.campaignId,
+            status: k.status || "UNUSED",
+            rawKey: raw,
+            createdAt: k.createdAt || k.activatedAt || Date.now(),
+          };
+          flatBatch[raw] = {
+            campaignId: k.campaignId,
+            status: k.status || "UNUSED",
+            createdAt: k.createdAt || k.activatedAt || Date.now(),
+          };
+        }
+        const resKeys = await rtdbUpdate("zbtKeys", keyBatch);
+        await rtdbUpdate("keys", flatBatch);
+        if (!resKeys.success) {
+          lastErr = resKeys.error || "PERMISSION_DENIED";
+        }
+      }
+
+      if (lastErr) {
+        setError(
+          `Realtime Database отклонила запись (${lastErr}). Откройте вкладку Rules в Firebase Console и опубликуйте открытые правила!`
+        );
+        setShowDbModal(true);
+      } else {
+        setNotice(
+          `✅ Успешная синхронизация: ${campCount} кампаний и ${localKeys.length} ключей записаны в Realtime Database (/zbtCampaigns, /zbtKeys, /keys)! Проверьте консоль Firebase.`
+        );
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Ошибка при синхронизации: ${msg}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   // OPTIMISTIC: Publish News
@@ -886,6 +995,39 @@ export default function App() {
             </div>
           </div>
 
+          {rtdbDiag.tested && !rtdbDiag.canWrite && (
+            <div className="rtdb-warning-banner">
+              <AlertTriangle size={18} />
+              <div className="rtdb-warning-text">
+                <b>Внимание: Realtime Database работает в закрытом режиме (.write: false).</b>
+                <span>
+                  В консоли Firebase запрещена запись. Созданные ключи и кампании сохраняются только локально в браузере и не отображаются в консоли Firebase (<code>data/~2F</code>).
+                </span>
+              </div>
+              <div className="rtdb-warning-actions">
+                <button className="button primary" onClick={() => setShowDbModal(true)}>
+                  <Lock size={13} /> Открыть правила RTDB
+                </button>
+                <a
+                  href={RTDB_RULES_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="button secondary"
+                >
+                  Вставить в Firebase <ExternalLink size={12} />
+                </a>
+                <button
+                  className="button secondary"
+                  onClick={() => void runRtdbDiagnostics()}
+                  disabled={rtdbDiag.testing}
+                  title="Проверить доступ после сохранения правил в Firebase"
+                >
+                  <RefreshCw size={12} className={rtdbDiag.testing ? "spin" : ""} /> Проверить
+                </button>
+              </div>
+            </div>
+          )}
+
           {notice && (
             <div className="notice success">
               <Check size={17} />
@@ -923,6 +1065,12 @@ export default function App() {
               revoke={revokeKey}
               role={role}
               onCreateCampaign={() => setShowCampaignForm(true)}
+              onSyncAll={syncAllToRtdb}
+              onOpenDbModal={() => setShowDbModal(true)}
+              isSyncing={busy}
+              canWrite={rtdbDiag.canWrite}
+              copiedKey={copiedKey}
+              setCopiedKey={setCopiedKey}
             />
           )}
           {page === "players" && (
@@ -1094,9 +1242,20 @@ export default function App() {
         <Modal title="Настройка и диагностика Realtime Database" close={() => setShowDbModal(false)}>
           <div className="form-stack">
             <div style={{ padding: "12px", background: "#f3f6f1", borderRadius: "6px", fontSize: "11px", color: "#324335" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: "700", marginBottom: "4px" }}>
-                <Server size={15} style={{ color: "#28744a" }} />
-                <span>База: furry-launcher-default-rtdb</span>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "4px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: "700" }}>
+                  <Server size={15} style={{ color: "#28744a" }} />
+                  <span>База: furry-launcher-default-rtdb</span>
+                </div>
+                <a
+                  href={RTDB_DATA_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="external-link"
+                  style={{ fontSize: "10px" }}
+                >
+                  Открыть data/~2F <ExternalLink size={11} />
+                </a>
               </div>
               <small className="mono" style={{ display: "block", color: "#657768", wordBreak: "break-all" }}>
                 {RTDB_URL}
@@ -1128,7 +1287,7 @@ export default function App() {
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                     <span>Запись в базу:</span>
                     <span className={`status-pill ${rtdbDiag.canWrite ? "status-active" : "status-banned"}`}>
-                      {rtdbDiag.canWrite ? "Разрешено" : "Заблокировано (PERMISSION_DENIED)"}
+                      {rtdbDiag.canWrite ? "Разрешено ✅" : "Заблокировано (PERMISSION_DENIED) ❌"}
                     </span>
                   </div>
                   {rtdbDiag.message && (
@@ -1140,13 +1299,94 @@ export default function App() {
               )}
             </div>
 
+            {/* Bulk Data Sync to RTDB */}
+            <div style={{ border: "1px solid #d9e6dc", background: "#fbfcf9", borderRadius: "6px", padding: "12px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                <strong style={{ fontSize: "11px", color: "#226946", display: "flex", alignItems: "center", gap: "6px" }}>
+                  <UploadCloud size={15} /> Отправить ключи и кампании в RTDB
+                </strong>
+                <button
+                  type="button"
+                  className="button primary"
+                  style={{ minHeight: "28px", padding: "0 10px", fontSize: "10px" }}
+                  onClick={() => void syncAllToRtdb()}
+                  disabled={busy}
+                >
+                  {busy ? <RefreshCw size={12} className="spin" /> : <UploadCloud size={12} />} Синхронизировать
+                </button>
+              </div>
+              <p style={{ margin: 0, fontSize: "10px", color: "#687569", lineHeight: 1.4 }}>
+                Если ключи создавались до настройки правил, эта кнопка принудительно запишет все {campaigns.length} кампаний и {keys.length} ключей в ветки <b>/zbtCampaigns</b>, <b>/zbtKeys</b> и <b>/keys</b>.
+              </p>
+            </div>
+
+            {/* Rules Configuration */}
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                <label style={{ margin: 0, fontWeight: "700", fontSize: "11px" }}>
+                  <Lock size={13} style={{ display: "inline", verticalAlign: "middle", marginRight: "4px" }} />
+                  Правила для Firebase Realtime Database
+                </label>
+                <div style={{ display: "flex", gap: "6px" }}>
+                  <button
+                    type="button"
+                    className="small-button"
+                    onClick={() => {
+                      const text = rulesTab === "dev" ? DEV_TEST_RTDB_RULES : RECOMMENDED_RTDB_RULES;
+                      void navigator.clipboard.writeText(text);
+                      setCopiedRules(true);
+                      setTimeout(() => setCopiedRules(false), 2000);
+                    }}
+                  >
+                    {copiedRules ? <Check size={12} /> : <Copy size={12} />} {copiedRules ? "Скопировано!" : "Копировать"}
+                  </button>
+                  <a
+                    href={RTDB_RULES_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="small-button"
+                    style={{ textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px" }}
+                  >
+                    Вставить в Rules <ExternalLink size={10} />
+                  </a>
+                </div>
+              </div>
+
+              {/* Rules tabs */}
+              <div className="rules-tabs">
+                <button
+                  type="button"
+                  className={`tab-btn ${rulesTab === "dev" ? "active" : ""}`}
+                  onClick={() => setRulesTab("dev")}
+                >
+                  ⚡ Быстрый режим (Тестовый .write: true)
+                </button>
+                <button
+                  type="button"
+                  className={`tab-btn ${rulesTab === "prod" ? "active" : ""}`}
+                  onClick={() => setRulesTab("prod")}
+                >
+                  🛡️ Рабочий режим (auth != null)
+                </button>
+              </div>
+
+              <p className="form-hint" style={{ marginBottom: "6px" }}>
+                {rulesTab === "dev"
+                  ? "Для немедленного сохранения: откройте ссылку «Вставить в Rules», замените правила на этот JSON и нажмите Publish."
+                  : "Для рабочего сервера: разрешает запись авторизованным сотрудникам и игрокам."}
+              </p>
+              <pre style={{ margin: 0, padding: "10px", background: "#1c2e22", color: "#c8e89f", borderRadius: "5px", fontSize: "9px", overflowX: "auto", fontFamily: "ui-monospace, monospace" }}>
+                {rulesTab === "dev" ? DEV_TEST_RTDB_RULES : RECOMMENDED_RTDB_RULES}
+              </pre>
+            </div>
+
             {/* One-click Initializer */}
             <div style={{ border: "1px solid #d9e6dc", background: "#f7fbf8", borderRadius: "6px", padding: "12px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: "700", fontSize: "12px", color: "#245d3c", marginBottom: "6px" }}>
-                <Sparkles size={16} /> Инициализация всех разделов базы в 1 клик
+                <Sparkles size={16} /> Инициализация всех разделов базы
               </div>
               <p style={{ margin: "0 0 10px", fontSize: "10px", color: "#546857", lineHeight: "1.5" }}>
-                Создаёт и настраивает все ключевые ветки в Realtime Database: <b>/admin</b>, <b>/staff</b>, <b>/config</b>, <b>/news</b>, <b>/players</b>, <b>/bans</b>.
+                Создаёт разделы: <b>/admin</b>, <b>/staff</b>, <b>/config</b>, <b>/news</b>, <b>/players</b>, <b>/bans</b>.
               </p>
               <button
                 type="button"
@@ -1156,33 +1396,6 @@ export default function App() {
               >
                 <CheckCheck size={14} /> Создать структуру базы сейчас
               </button>
-            </div>
-
-            {/* Rules Helper */}
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                <label style={{ margin: 0, fontWeight: "700", fontSize: "11px" }}>
-                  <Lock size={13} style={{ display: "inline", verticalAlign: "middle", marginRight: "4px" }} />
-                  Правила для Firebase Realtime Database
-                </label>
-                <button
-                  type="button"
-                  className="small-button"
-                  onClick={() => {
-                    void navigator.clipboard.writeText(RECOMMENDED_RTDB_RULES);
-                    setCopiedRules(true);
-                    setTimeout(() => setCopiedRules(false), 2000);
-                  }}
-                >
-                  {copiedRules ? <Check size={12} /> : <Copy size={12} />} {copiedRules ? "Скопировано!" : "Копировать"}
-                </button>
-              </div>
-              <p className="form-hint" style={{ marginBottom: "6px" }}>
-                Вставьте этот JSON в Firebase Console → Realtime Database → вкладка «Rules» (Правила), чтобы разрешить запись авторизованным администраторам:
-              </p>
-              <pre style={{ margin: 0, padding: "10px", background: "#1c2e22", color: "#c8e89f", borderRadius: "5px", fontSize: "9px", overflowX: "auto", fontFamily: "ui-monospace, monospace" }}>
-                {RECOMMENDED_RTDB_RULES}
-              </pre>
             </div>
 
             <div className="modal-actions">
@@ -1483,16 +1696,56 @@ function ZbtPage(props: {
   revoke: (id: string) => void;
   role: Role;
   onCreateCampaign: () => void;
+  onSyncAll: () => Promise<void>;
+  onOpenDbModal: () => void;
+  isSyncing?: boolean;
+  canWrite?: boolean;
+  copiedKey: string;
+  setCopiedKey: (k: string) => void;
 }) {
   return (
     <div className="data-section">
       <div className="section-head">
         <div>
           <p className="eyebrow">BETA ACCESS</p>
-          <h2>Кампании и активации ЗБТ</h2>
+          <h2>Кампании и активации ЗБТ ({props.campaigns.length})</h2>
         </div>
-        <span className="subtle">Синхронизируются в RTDB /zbtCampaigns</span>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            className="button secondary"
+            style={{ height: "30px", fontSize: "10px", padding: "0 10px" }}
+            onClick={props.onOpenDbModal}
+            title="Проверить статус подключения к Realtime Database"
+          >
+            <Lock size={12} /> Правила RTDB
+          </button>
+          <button
+            className="button primary"
+            style={{ height: "30px", fontSize: "10px", padding: "0 10px" }}
+            onClick={() => void props.onSyncAll()}
+            disabled={props.isSyncing}
+            title="Принудительно записать все созданные ключи и кампании в консоль Firebase (/zbtCampaigns, /zbtKeys, /keys)"
+          >
+            <UploadCloud size={13} className={props.isSyncing ? "spin" : ""} />
+            {props.isSyncing ? "Синхронизация..." : "Отправить всё в RTDB"}
+          </button>
+        </div>
       </div>
+
+      {props.canWrite === false && (
+        <div style={{ padding: "10px 14px", background: "#fdf8ea", border: "1px solid #f2db9b", borderRadius: "6px", marginBottom: "16px", fontSize: "11px", color: "#7a5813", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+          <div>
+            <b>⚠️ Запись в базу заблокирована (.write: false).</b>
+            <div style={{ fontSize: "10px", marginTop: "2px" }}>
+              Ключи создаются в браузере, но не появляются в Firebase Console (<code>data/~2F</code>), пока вы не опубликуете правила.
+            </div>
+          </div>
+          <button className="button primary" style={{ minHeight: "26px", fontSize: "10px", flexShrink: 0 }} onClick={props.onOpenDbModal}>
+            <Lock size={12} /> Настроить правила
+          </button>
+        </div>
+      )}
+
       <div className="table-wrap">
         <table>
           <thead>
@@ -1567,44 +1820,69 @@ function ZbtPage(props: {
               <p className="eyebrow">CAMPAIGN KEYS</p>
               <h3>Ключи выбранной кампании ({props.keys.length})</h3>
             </div>
-            <span className="subtle">Синхронизируются в RTDB /zbtKeys</span>
+            <span className="subtle">Синхронизируются в RTDB /zbtKeys и /keys</span>
           </div>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
+                  <th>КЛЮЧ ЗБТ</th>
                   <th>СТАТУС</th>
                   <th>ИГРОК</th>
                   <th>UID ИГРОКА</th>
-                  <th>ДАТА АКТИВАЦИИ</th>
+                  <th>ДАТА СОЗДАНИЯ / АКТИВАЦИИ</th>
                   <th>ДЕЙСТВИЕ</th>
                 </tr>
               </thead>
               <tbody>
-                {props.keys.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      <StatusPill value={item.status} />
-                    </td>
-                    <td>{item.nickname || "—"}</td>
-                    <td className="mono">{item.activatedBy || "—"}</td>
-                    <td>{dateLabel(item.activatedAt)}</td>
-                    <td>
-                      {props.role === "owner" && item.status !== "REVOKED" && (
-                        <button
-                          className="icon-button danger-icon"
-                          onClick={() => props.revoke(item.id)}
-                          title="Отозвать ключ ЗБТ"
-                        >
-                          <Ban size={15} />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {props.keys.map((item) => {
+                  const raw = item.rawKey || item.id;
+                  const isCopied = props.copiedKey === item.id;
+                  return (
+                    <tr key={item.id}>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <code className="mono" style={{ fontWeight: "700", color: "#19422b", fontSize: "10px", background: "#f0f5ee", padding: "2px 6px", borderRadius: "3px" }}>
+                            {raw}
+                          </code>
+                          <button
+                            type="button"
+                            className="icon-button"
+                            style={{ width: "22px", height: "22px" }}
+                            onClick={() => {
+                              void navigator.clipboard.writeText(raw);
+                              props.setCopiedKey(item.id);
+                              setTimeout(() => props.setCopiedKey(""), 2000);
+                            }}
+                            title="Скопировать ключ"
+                          >
+                            {isCopied ? <Check size={12} style={{ color: "#28744a" }} /> : <Copy size={12} />}
+                          </button>
+                        </div>
+                      </td>
+                      <td>
+                        <StatusPill value={item.status} />
+                      </td>
+                      <td>{item.nickname || "—"}</td>
+                      <td className="mono">{item.activatedBy || "—"}</td>
+                      <td>{dateLabel(item.activatedAt || item.createdAt)}</td>
+                      <td>
+                        {props.role === "owner" && item.status !== "REVOKED" && (
+                          <button
+                            className="icon-button danger-icon"
+                            onClick={() => props.revoke(item.id)}
+                            title="Отозвать ключ ЗБТ"
+                          >
+                            <Ban size={15} />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!props.keys.length && (
                   <tr>
-                    <td colSpan={5}>
+                    <td colSpan={6}>
                       <EmptyState text="Для этой кампании пока нет записей ключей" />
                     </td>
                   </tr>
