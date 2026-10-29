@@ -122,6 +122,16 @@ export async function rtdbTestAccess(): Promise<{ canRead: boolean; canWrite: bo
   return { canRead, canWrite, message };
 }
 
+export const RTDB_RULES_URL = "https://console.firebase.google.com/project/furry-launcher/database/furry-launcher-default-rtdb/rules";
+export const RTDB_DATA_URL = "https://console.firebase.google.com/project/furry-launcher/database/furry-launcher-default-rtdb/data/~2F";
+
+export const DEV_TEST_RTDB_RULES = `{
+  "rules": {
+    ".read": true,
+    ".write": true
+  }
+}`;
+
 export const RECOMMENDED_RTDB_RULES = `{
   "rules": {
     ".read": "auth != null",
@@ -130,12 +140,36 @@ export const RECOMMENDED_RTDB_RULES = `{
       ".read": true,
       ".write": "auth != null && auth.token.email === 'a60840397@gmail.com'"
     },
+    "keys": {
+      ".read": true,
+      ".write": "auth != null"
+    },
+    "zbtKeys": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "zbtCampaigns": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
     "news": {
       ".read": true,
       ".write": "auth != null"
     },
     "bans": {
       ".read": true,
+      ".write": "auth != null"
+    },
+    "players": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "staff": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "auditLog": {
+      ".read": "auth != null",
       ".write": "auth != null"
     },
     "config": {
