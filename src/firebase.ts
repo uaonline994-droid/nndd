@@ -87,6 +87,10 @@ export async function rtdbGet<T>(path: string): Promise<T | null> {
   return snapshot.exists() ? snapshot.val() as T : null;
 }
 
+export function rtdbSubscribe<T>(path: string, onData: (value: T | null) => void, onError?: (error: Error) => void) {
+  return onValue(ref(rtdb, path), (snapshot) => onData(snapshot.exists() ? snapshot.val() as T : null), onError);
+}
+
 // Test live read/write access to RTDB
 export async function rtdbTestAccess(): Promise<{ canRead: boolean; canWrite: boolean; message: string }> {
   let canRead = false;
@@ -144,6 +148,10 @@ export const RECOMMENDED_RTDB_RULES = `{
       ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     },
     "zbtKeys": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
+    "keys": {
       ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
       ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     },

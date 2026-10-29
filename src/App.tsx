@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
-  auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove,
+  auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
   rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
   enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
 } from "./firebase";
@@ -16,7 +16,7 @@ type Role = "owner" | "support" | "marketing";
 type Page = "overview" | "zbt" | "players" | "errors" | "news" | "staff" | "analytics" | "audit";
 type Campaign = { id: string; name: string; seats: number; status: string; activatedCount: number; createdAt?: number; expiresAt?: number | null };
 type Player = { uid: string; nickname: string; contactEmail: string; status: string; zbtCampaignId?: string; lastSeenAt?: number };
-type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; nickname?: string; installId?: string; activatedAt?: number; rawKey?: string; createdAt?: number };
+type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; usedBy?: string; nickname?: string; installId?: string; activatedAt?: number; usedAt?: number; used?: boolean; rawKey?: string; createdAt?: number; storagePath?: "keys" | "zbtKeys" };
 type CrmError = { id: string; fingerprint: string; title: string; area: string; status: string; occurrences: number; affectedPlayers: number; updatedAt?: number; version?: string };
 type Announcement = { id: string; title: string; body: string; status: string; updatedAt?: number; author?: string };
 type StaffMember = { id: string; email: string; displayName?: string; role: Role; isChief?: boolean; createdAt?: number; invitedBy?: string };
@@ -38,27 +38,6 @@ function dateLabel(value?: number) {
   return value ? new Date(value).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" }) : "—";
 }
 
-const ZBT_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTVWXYZ";
-
-function makeZbtKey(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(10));
-  let payload = "";
-  let buffer = 0;
-  let bits = 0;
-  for (const byte of bytes) {
-    buffer = (buffer << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      bits -= 5;
-      payload += ZBT_ALPHABET[(buffer >> bits) & 31];
-      buffer &= (1 << bits) - 1;
-    }
-  }
-  const checksumValue = [...payload].reduce((sum, char, index) => sum + (index + 1) * (ZBT_ALPHABET.indexOf(char) + 1), 0);
-  const body = `${payload}${ZBT_ALPHABET[checksumValue % ZBT_ALPHABET.length]}`;
-  return `FZBT-${body.slice(0, 4)}-${body.slice(4, 8)}-${body.slice(8, 12)}-${body.slice(12, 16)}-${body[16]}`;
-}
-
 async function hashZbtKey(displayKey: string): Promise<string> {
   const compact = displayKey.replace(/[-\s]/g, "").toUpperCase();
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(compact));
@@ -70,6 +49,10 @@ function errorText(error: unknown) {
     return String((error as { message: unknown }).message).replace(/^Firebase: /, "");
   }
   return "Не удалось выполнить операцию.";
+}
+
+function recordRows<T extends object>(records: Record<string, T> | null): Array<T & { id: string }> {
+  return (Object.entries(records || {}) as Array<[string, T]>).map(([id, value]) => ({ ...value, id }));
 }
 
 export default function App() {
@@ -118,6 +101,7 @@ export default function App() {
   const [smsCode, setSmsCode] = useState("");
   const [mfaVerificationId, setMfaVerificationId] = useState("");
   const mfaVerifier = useRef<RecaptchaVerifier | null>(null);
+  const createdKeysByHash = useRef(new Map<string, string>());
 
   // RTDB Diagnostics state
   const [rtdbDiag, setRtdbDiag] = useState<{ testing: boolean; tested: boolean; canRead: boolean; canWrite: boolean; message: string }>({
@@ -178,6 +162,49 @@ export default function App() {
     void loadPage(page);
   }, [user, secondFactor, role, page]);
 
+  useEffect(() => {
+    if (!user || !secondFactor || !role || page !== "zbt") return;
+    return rtdbSubscribe<Record<string, Campaign>>("zbtCampaigns", (records) => {
+      const liveCampaigns = Object.entries(records || {}).map(([id, value]) => ({ ...value, id }));
+      setCampaigns(liveCampaigns);
+    }, (cause) => setError(errorText(cause)));
+  }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
+    if (!user || !secondFactor || !role || page !== "zbt" || !selectedCampaign) return;
+    const recordsByPath: Record<string, Record<string, ZbtKey>> = {};
+    const applyKeys = () => {
+      const merged = new Map<string, ZbtKey>();
+      for (const storagePath of ["zbtKeys", "keys"] as const) {
+        for (const [id, value] of Object.entries(recordsByPath[storagePath] || {})) {
+          if (!value || value.campaignId !== selectedCampaign) continue;
+          merged.set(id, {
+            ...value,
+            id,
+            rawKey: value.rawKey || createdKeysByHash.current.get(id),
+            storagePath,
+            activatedBy: value.activatedBy || value.usedBy,
+            activatedAt: value.activatedAt || value.usedAt,
+            status: value.status || (value.used ? "ACTIVATED" : "UNUSED"),
+          });
+        }
+      }
+      setKeys([...merged.values()]);
+    };
+    const unsubscribeLegacy = rtdbSubscribe<Record<string, ZbtKey>>("zbtKeys", (records) => {
+      recordsByPath.zbtKeys = records || {};
+      applyKeys();
+    }, (cause) => setError(errorText(cause)));
+    const unsubscribeCanonical = rtdbSubscribe<Record<string, ZbtKey>>("keys", (records) => {
+      recordsByPath.keys = records || {};
+      applyKeys();
+    }, (cause) => setError(errorText(cause)));
+    return () => {
+      unsubscribeLegacy();
+      unsubscribeCanonical();
+    };
+  }, [user, secondFactor, role, page, selectedCampaign]);
+
   async function loadPage(target: Page) {
     setBusy(true);
     setError("");
@@ -192,21 +219,19 @@ export default function App() {
         ]);
 
         if (rtdbCampaigns) {
-          const list = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
-          setCampaigns(list);
+          setCampaigns(recordRows(rtdbCampaigns));
         }
         if (rtdbErrors) {
-          const list = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
-          setErrors(list);
+          setErrors(recordRows(rtdbErrors));
         }
 
-        const dailyList = rtdbDaily ? Object.entries(rtdbDaily).map(([id, val]) => ({ ...val, id })) : [];
+        const dailyList = recordRows(rtdbDaily);
         const count = rtdbPlayers ? Object.keys(rtdbPlayers).length : players.length;
 
         setOverview({
           playerCount: count,
-          campaigns: rtdbCampaigns ? Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id })) : campaigns,
-          errors: rtdbErrors ? Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id })) : errors,
+          campaigns: rtdbCampaigns ? recordRows(rtdbCampaigns) : campaigns,
+          errors: rtdbErrors ? recordRows(rtdbErrors) : errors,
           daily: dailyList,
         });
       }
@@ -214,8 +239,7 @@ export default function App() {
       if (target === "zbt") {
         const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns").catch(() => null);
         if (rtdbCampaigns) {
-          const list = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
-          setCampaigns(list);
+          setCampaigns(recordRows(rtdbCampaigns));
         }
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
@@ -225,7 +249,7 @@ export default function App() {
         const rtdbBans = await rtdbGet<Record<string, { bannedAt?: number; reason?: string }>>("bans").catch(() => null);
 
         if (rtdbPlayers) {
-          const list = Object.entries(rtdbPlayers).map(([uid, p]) => ({
+          const list = (Object.entries(rtdbPlayers) as Array<[string, Player]>).map(([uid, p]) => ({
             ...p,
             uid,
             status: rtdbBans && rtdbBans[uid] ? "BANNED" : p.status || "ACTIVE",
@@ -237,34 +261,26 @@ export default function App() {
       if (target === "errors") {
         const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors").catch(() => null);
         if (rtdbErrors) {
-          const list = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
-          setErrors(list);
+          setErrors(recordRows(rtdbErrors));
         }
       }
 
       if (target === "news") {
         const rtdbNews = await rtdbGet<Record<string, Announcement>>("news").catch(() => null);
         if (rtdbNews) {
-          const list = Object.entries(rtdbNews).map(([id, val]) => ({ ...val, id }));
-          setAnnouncements(list);
+          setAnnouncements(recordRows(rtdbNews));
         }
       }
 
       if (target === "staff") {
         const rtdbStaff = await rtdbGet<Record<string, StaffMember>>("staff").catch(() => null);
-        const rows = rtdbStaff
-          ? Object.entries(rtdbStaff).map(([id, member]) => ({ ...member, id }))
-          : [];
-        setStaff(rows);
+        setStaff(recordRows(rtdbStaff));
       }
 
       if (target === "audit") {
         const rtdbAudit = await rtdbGet<Record<string, AuditEntry>>("auditLog").catch(() => null);
         if (rtdbAudit) {
-          const list = Object.entries(rtdbAudit)
-            .map(([id, val]) => ({ ...val, id }))
-            .sort((a, b) => (b.at || 0) - (a.at || 0));
-          setAudit(list);
+          setAudit(recordRows<AuditEntry>(rtdbAudit).sort((a, b) => (b.at || 0) - (a.at || 0)));
         }
       }
     } catch (err) {
@@ -278,17 +294,29 @@ export default function App() {
   async function loadKeys(campaignId: string) {
     setSelectedCampaign(campaignId);
     try {
-      const rtdbKeys = await rtdbGet<Record<string, ZbtKey>>("zbtKeys").catch(() => null);
-      if (rtdbKeys && Object.keys(rtdbKeys).length > 0) {
-        const list = Object.entries(rtdbKeys)
-          .map(([id, val]) => ({ ...val, id }))
-          .filter((k) => k.campaignId === campaignId);
-        if (list.length > 0) {
-          setKeys(list);
-          return;
+      const [zbtKeys, legacyKeys] = await Promise.all([
+        rtdbGet<Record<string, ZbtKey>>("zbtKeys").catch(() => null),
+        rtdbGet<Record<string, ZbtKey>>("keys").catch(() => null),
+      ]);
+      const merged = new Map<string, ZbtKey>();
+      const sources: Array<["keys" | "zbtKeys", Record<string, ZbtKey> | null]> = [
+        ["zbtKeys", zbtKeys],
+        ["keys", legacyKeys],
+      ];
+      for (const [storagePath, records] of sources) {
+        for (const [id, value] of Object.entries(records || {}) as Array<[string, ZbtKey]>) {
+          if (!value || value.campaignId !== campaignId) continue;
+          merged.set(id, {
+            ...value,
+            id,
+            storagePath,
+            activatedBy: value.activatedBy || value.usedBy,
+            activatedAt: value.activatedAt || value.usedAt,
+            status: value.status || (value.used ? "ACTIVATED" : "UNUSED"),
+          });
         }
       }
-      setKeys([]);
+      setKeys([...merged.values()]);
     } catch (cause) {
       console.warn("Error loading keys:", cause);
     }
@@ -414,52 +442,44 @@ export default function App() {
     setError("");
     try {
       const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
-      const campaignId = `zbt_${crypto.randomUUID()}`;
-      const generatedKeys = Array.from({ length: campaignSeats }, makeZbtKey);
-      const createdAt = Date.now();
-      const campaignPayload: Campaign = {
-        id: campaignId,
+      const created = await call<{ campaignId: string; name: string; seats: number; keys: string[] }>("createZbtCampaign", {
         name: campaignName.trim(),
         seats: campaignSeats,
+        expiresAtMs,
+      });
+      const createdAt = Date.now();
+      const campaignPayload: Campaign = {
+        id: created.campaignId,
+        name: created.name,
+        seats: created.seats,
         status: "ACTIVE",
         activatedCount: 0,
         createdAt,
         expiresAt: expiresAtMs,
       };
-      const newKeysList: ZbtKey[] = await Promise.all(generatedKeys.map(async (rawKey) => ({
+      const newKeysList: ZbtKey[] = await Promise.all(created.keys.map(async (rawKey) => ({
         id: await hashZbtKey(rawKey),
-        campaignId,
+        rawKey,
+        storagePath: "keys",
+        campaignId: created.campaignId,
         status: "UNUSED",
         createdAt,
       })));
-      const keyBatch = Object.fromEntries(newKeysList.map((item) => [item.id, {
-        campaignId,
-        campaignName: campaignPayload.name,
-        status: item.status,
-        createdAt,
-        expiresAt: expiresAtMs,
-      }]));
-
-      const campaignWrite = await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
-      if (!campaignWrite.success) throw new Error(campaignWrite.error || "Не удалось сохранить кампанию.");
-      const keyWrite = await rtdbUpdate("zbtKeys", keyBatch);
-      if (!keyWrite.success) {
-        await rtdbRemove(`zbtCampaigns/${campaignId}`);
-        throw new Error(keyWrite.error || "Не удалось сохранить хеши ключей.");
+      for (const key of newKeysList) {
+        if (key.rawKey) createdKeysByHash.current.set(key.id, key.rawKey);
       }
 
       setCampaigns((previous) => [campaignPayload, ...previous]);
       setKeys((previous) => [...newKeysList, ...previous]);
-      setSelectedCampaign(campaignId);
-      localStorage.removeItem(STORAGE_PREFIX + "keys");
-      const csvContent = "index,key,campaign,status\n" + generatedKeys.map((key, index) => `${index + 1},${key},${campaignPayload.name},UNUSED`).join("\n");
+      setSelectedCampaign(created.campaignId);
+      const csvContent = "index,key,campaign,status\n" + created.keys.map((key, index) => `${index + 1},${key},${campaignPayload.name},UNUSED`).join("\n");
       const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(file);
       link.download = `${campaignPayload.name.replace(/[^\p{L}\p{N}-]+/gu, "-")}-keys.csv`;
       link.click();
       URL.revokeObjectURL(link.href);
-      setNotice("Кампания и хеши ключей записаны. Открытые ключи доступны только в скачанном CSV.");
+      setNotice("Кампания и ключи записаны в общую базу Realtime Database.");
       setCampaignName("");
       setShowCampaignForm(false);
     } catch (cause) {
@@ -499,22 +519,24 @@ export default function App() {
   }
 
   async function setCampaignStatus(campaignId: string, status: string) {
-    setCampaigns((prev) => {
-      const updated = prev.map((c) => (c.id === campaignId ? { ...c, status } : c));
-      return updated;
-    });
-    setNotice(`Статус кампании обновлён: ${status}`);
-    await rtdbUpdate(`zbtCampaigns/${campaignId}`, { status, updatedAt: Date.now() });
+    try {
+      await call("setCampaignStatus", { campaignId, status });
+      setCampaigns((prev) => prev.map((campaign) => campaign.id === campaignId ? { ...campaign, status } : campaign));
+      setNotice(`Статус кампании обновлён: ${status}`);
+    } catch (cause) {
+      setError(errorText(cause));
+    }
   }
 
-  async function revokeKey(keyId: string) {
+  async function revokeKey(keyId: string, storagePath: "keys" | "zbtKeys" = "zbtKeys") {
     if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
-    setKeys((prev) => {
-      const updated = prev.map((k) => (k.id === keyId ? { ...k, status: "REVOKED" } : k));
-      return updated;
-    });
-    setNotice("Ключ ЗБТ отозван.");
-    await rtdbUpdate(`zbtKeys/${keyId}`, { status: "REVOKED", revokedAt: Date.now() });
+    try {
+      await call("revokeZbtKey", { keyId, storagePath });
+      setKeys((prev) => prev.map((key) => key.id === keyId ? { ...key, status: "REVOKED" } : key));
+      setNotice("Ключ ЗБТ отозван.");
+    } catch (cause) {
+      setError(errorText(cause));
+    }
   }
 
   async function updateError(errorItem: CrmError, status: string) {
@@ -1156,6 +1178,7 @@ function AccessScreen({
   email,
   uid,
   error,
+  diagnostic,
   onSignOut,
 }: {
   email: string;
@@ -1386,7 +1409,7 @@ function ZbtPage(props: {
   selectedCampaign: string;
   selectCampaign: (id: string) => void;
   setStatus: (id: string, status: string) => void;
-  revoke: (id: string) => void;
+  revoke: (id: string, storagePath?: "keys" | "zbtKeys") => void;
   role: Role;
   onCreateCampaign: () => void;
   onOpenDbModal: () => void;
@@ -1486,7 +1509,7 @@ function ZbtPage(props: {
               <p className="eyebrow">CAMPAIGN KEYS</p>
               <h3>Ключи выбранной кампании ({props.keys.length})</h3>
             </div>
-            <span className="subtle">Синхронизируются в RTDB /zbtKeys и /keys</span>
+            <span className="subtle">Ключи хранятся в RTDB /zbtKeys и /keys</span>
           </div>
           <div className="table-wrap">
             <table>
@@ -1536,7 +1559,7 @@ function ZbtPage(props: {
                         {props.role === "owner" && item.status !== "REVOKED" && (
                           <button
                             className="icon-button danger-icon"
-                            onClick={() => props.revoke(item.id)}
+                            onClick={() => props.revoke(item.id, item.storagePath)}
                             title="Отозвать ключ ЗБТ"
                           >
                             <Ban size={15} />
