@@ -83,16 +83,8 @@ export async function rtdbRemove(path: string): Promise<{ success: boolean; erro
 }
 
 export async function rtdbGet<T>(path: string): Promise<T | null> {
-  try {
-    const snapshot = await get(ref(rtdb, path));
-    if (snapshot.exists()) {
-      return snapshot.val() as T;
-    }
-    return null;
-  } catch (err) {
-    console.warn(`RTDB get error at ${path}:`, err);
-    return null;
-  }
+  const snapshot = await get(ref(rtdb, path));
+  return snapshot.exists() ? snapshot.val() as T : null;
 }
 
 // Test live read/write access to RTDB
@@ -102,7 +94,7 @@ export async function rtdbTestAccess(): Promise<{ canRead: boolean; canWrite: bo
   let message = "";
 
   try {
-    await get(ref(rtdb, "admin"));
+    await get(ref(rtdb, "config"));
     canRead = true;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -125,56 +117,59 @@ export async function rtdbTestAccess(): Promise<{ canRead: boolean; canWrite: bo
 export const RTDB_RULES_URL = "https://console.firebase.google.com/project/furry-launcher/database/furry-launcher-default-rtdb/rules";
 export const RTDB_DATA_URL = "https://console.firebase.google.com/project/furry-launcher/database/furry-launcher-default-rtdb/data/~2F";
 
-export const DEV_TEST_RTDB_RULES = `{
-  "rules": {
-    ".read": true,
-    ".write": true
-  }
-}`;
-
 export const RECOMMENDED_RTDB_RULES = `{
   "rules": {
-    ".read": "auth != null",
-    ".write": "auth != null",
-    "admin": {
-      ".read": true,
-      ".write": "auth != null && auth.token.email === 'a60840397@gmail.com'"
+    ".read": false,
+    ".write": false,
+    "staff": {
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || (auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'))",
+        ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+      }
     },
-    "keys": {
-      ".read": true,
-      ".write": "auth != null"
+    "players": {
+      "$uid": {
+        ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+        ".write": false
+      }
     },
-    "zbtKeys": {
-      ".read": "auth != null",
-      ".write": "auth != null"
+    "presence": {
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || (auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support'))) ",
+        ".write": "auth != null && auth.uid === $uid"
+      }
     },
     "zbtCampaigns": {
-      ".read": "auth != null",
-      ".write": "auth != null"
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
+    "zbtKeys": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     },
     "news": {
       ".read": true,
-      ".write": "auth != null"
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'marketing')"
     },
     "bans": {
-      ".read": true,
-      ".write": "auth != null"
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')"
     },
-    "players": {
-      ".read": "auth != null",
-      ".write": "auth != null"
+    "errors": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')"
     },
-    "staff": {
-      ".read": "auth != null",
-      ".write": "auth != null"
+    "dailyAnalytics": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support' || root.child('staff').child(auth.uid).child('role').val() === 'marketing')",
+      ".write": false
     },
     "auditLog": {
-      ".read": "auth != null",
-      ".write": "auth != null"
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')"
     },
     "config": {
       ".read": true,
-      ".write": "auth != null"
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     }
   }
 }`;

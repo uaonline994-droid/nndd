@@ -8,7 +8,7 @@ import {
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
   auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove,
-  rtdbTestAccess, RECOMMENDED_RTDB_RULES, DEV_TEST_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
+  rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
   enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
 } from "./firebase";
 
@@ -22,27 +22,6 @@ type Announcement = { id: string; title: string; body: string; status: string; u
 type StaffMember = { id: string; email: string; displayName?: string; role: Role; isChief?: boolean; createdAt?: number; invitedBy?: string };
 type AuditEntry = { id: string; actorUid: string; action: string; payload: Record<string, unknown>; at?: number };
 type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> };
-
-const PRIMARY_CHIEF_EMAIL = "a60840397@gmail.com";
-const TRUSTED_OWNERS = [PRIMARY_CHIEF_EMAIL.toLowerCase(), "uaonline994@gmail.com".toLowerCase()];
-
-// Local storage backup keys
-const STORAGE_PREFIX = "fl_crm_";
-function saveLocal<T>(key: string, data: T) {
-  try {
-    localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(data));
-  } catch (err) {
-    console.warn("Storage save failed:", err);
-  }
-}
-function loadLocal<T>(key: string, defaultVal: T): T {
-  try {
-    const raw = localStorage.getItem(STORAGE_PREFIX + key);
-    return raw ? JSON.parse(raw) : defaultVal;
-  } catch {
-    return defaultVal;
-  }
-}
 
 const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "overview", label: "Обзор", icon: LayoutDashboard },
@@ -59,6 +38,33 @@ function dateLabel(value?: number) {
   return value ? new Date(value).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" }) : "—";
 }
 
+const ZBT_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTVWXYZ";
+
+function makeZbtKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(10));
+  let payload = "";
+  let buffer = 0;
+  let bits = 0;
+  for (const byte of bytes) {
+    buffer = (buffer << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      payload += ZBT_ALPHABET[(buffer >> bits) & 31];
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  const checksumValue = [...payload].reduce((sum, char, index) => sum + (index + 1) * (ZBT_ALPHABET.indexOf(char) + 1), 0);
+  const body = `${payload}${ZBT_ALPHABET[checksumValue % ZBT_ALPHABET.length]}`;
+  return `FZBT-${body.slice(0, 4)}-${body.slice(4, 8)}-${body.slice(8, 12)}-${body.slice(12, 16)}-${body[16]}`;
+}
+
+async function hashZbtKey(displayKey: string): Promise<string> {
+  const compact = displayKey.replace(/[-\s]/g, "").toUpperCase();
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(compact));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function errorText(error: unknown) {
   if (typeof error === "object" && error && "message" in error) {
     return String((error as { message: unknown }).message).replace(/^Firebase: /, "");
@@ -72,7 +78,6 @@ export default function App() {
   const [page, setPage] = useState<Page>("overview");
   const [loading, setLoading] = useState(true);
   const [secondFactor, setSecondFactor] = useState(false);
-  const [bypassMfa, setBypassMfa] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [accessDiagnostic, setAccessDiagnostic] = useState("");
@@ -80,20 +85,13 @@ export default function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
 
   // Optimistic data states initialized from LocalStorage
-  const [campaigns, setCampaigns] = useState<Campaign[]>(() => loadLocal<Campaign[]>("campaigns", []));
-  const [players, setPlayers] = useState<Player[]>(() => loadLocal<Player[]>("players", [
-    { uid: "p_steve_01", nickname: "AlexPlayer", contactEmail: "alex@example.com", status: "ACTIVE", lastSeenAt: Date.now() - 3600000 },
-    { uid: "p_miner_99", nickname: "Gamer99", contactEmail: "gamer@example.com", status: "ACTIVE", lastSeenAt: Date.now() - 86400000 },
-  ]));
-  const [errors, setErrors] = useState<CrmError[]>(() => loadLocal<CrmError[]>("errors", []));
-  const [announcements, setAnnouncements] = useState<Announcement[]>(() => loadLocal<Announcement[]>("news", [
-    { id: "news_welcome", title: "Добро пожаловать в F Launcher", body: "Клиент готов к закрытому бета-тестированию.", status: "PUBLISHED", updatedAt: Date.now() }
-  ]));
-  const [staff, setStaff] = useState<StaffMember[]>(() => loadLocal<StaffMember[]>("staff", [
-    { id: "chief", email: PRIMARY_CHIEF_EMAIL, displayName: "Главный администратор", role: "owner", isChief: true, createdAt: Date.now() }
-  ]));
-  const [audit, setAudit] = useState<AuditEntry[]>(() => loadLocal<AuditEntry[]>("audit", []));
-  const [keys, setKeys] = useState<ZbtKey[]>(() => loadLocal<ZbtKey[]>("keys", []));
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [errors, setErrors] = useState<CrmError[]>([]);
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [staff, setStaff] = useState<StaffMember[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [keys, setKeys] = useState<ZbtKey[]>([]);
 
   const [selectedCampaign, setSelectedCampaign] = useState("");
   const [queryText, setQueryText] = useState("");
@@ -111,6 +109,7 @@ export default function App() {
   const [campaignSeats, setCampaignSeats] = useState(50);
   const [campaignExpiry, setCampaignExpiry] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteUid, setInviteUid] = useState("");
   const [inviteRole, setInviteRole] = useState<Role>("support");
   const [newsTitle, setNewsTitle] = useState("");
   const [newsBody, setNewsBody] = useState("");
@@ -129,10 +128,9 @@ export default function App() {
     message: "",
   });
   const [copiedRules, setCopiedRules] = useState(false);
-  const [rulesTab, setRulesTab] = useState<"dev" | "prod">("dev");
   const [copiedKey, setCopiedKey] = useState("");
 
-  // Authentication observer
+  // CRM role is provisioned in RTDB by a project administrator.
   useEffect(() => {
     return onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
@@ -146,89 +144,29 @@ export default function App() {
         return;
       }
 
-      const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
-      const isChief = tokenEmail === PRIMARY_CHIEF_EMAIL.toLowerCase();
-      const isTrusted = TRUSTED_OWNERS.includes(tokenEmail);
-
-      // STEP 1: Unconditional instant Owner grant for Chief / Trusted Owner
-      if (isChief || isTrusted) {
-        setRole("owner");
-        setAccessDiagnostic("Доступ подтверждён (Главный администратор).");
-        setSecondFactor(true);
-        setBypassMfa(true);
-        setLoading(false);
-
-        // Ensure Chief staff entry exists in local state
-        setStaff((prev) => {
-          if (!prev.some((s) => s.email.toLowerCase() === tokenEmail)) {
-            const chiefEntry: StaffMember = {
-              id: "chief",
-              email: tokenEmail,
-              displayName: currentUser.displayName || (isChief ? "Главный администратор" : tokenEmail.split("@")[0]),
-              role: "owner",
-              isChief,
-              createdAt: Date.now(),
-            };
-            const updated = [chiefEntry, ...prev];
-            saveLocal("staff", updated);
-            return updated;
-          }
-          return prev;
-        });
-
-        // Background write to RTDB & auto-diagnostics
-        void (async () => {
-          await rtdbSet(`staff/${currentUser.uid}`, {
-            email: tokenEmail,
-            displayName: currentUser.displayName || "Главный администратор",
-            role: "owner",
-            isChief,
-            updatedAt: Date.now(),
-          });
-          await rtdbSet("admin", tokenEmail);
-          await runRtdbDiagnostics();
-        })();
-
-        return;
-      }
-
-      // STEP 2: For other users, verify in RTDB
       try {
-        const rtdbAdminVal = await rtdbGet<string>("admin").catch(() => null);
-        if (rtdbAdminVal && String(rtdbAdminVal).trim().toLowerCase() === tokenEmail) {
-          setRole("owner");
-          setAccessDiagnostic("Доступ подтверждён (RTDB Admin).");
-          setSecondFactor(true);
-          setLoading(false);
-          return;
+        const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
+        const staffMember = await rtdbGet<StaffMember>(`staff/${currentUser.uid}`);
+        const staffEmail = staffMember?.email?.trim().toLowerCase() || "";
+        const validRole = staffMember?.role === "owner" || staffMember?.role === "support" || staffMember?.role === "marketing";
+        if (!staffMember) {
+          setRole(null);
+          setAccessDiagnostic(`В RTDB не найден staff/${currentUser.uid}. Администратор проекта должен создать эту запись.`);
+        } else if (staffEmail !== tokenEmail) {
+          setRole(null);
+          setAccessDiagnostic(`Email в staff/${currentUser.uid} не совпадает с текущим Google-аккаунтом.`);
+        } else if (!validRole) {
+          setRole(null);
+          setAccessDiagnostic(`Недопустимая роль «${staffMember.role}». Разрешены owner, support, marketing.`);
+        } else {
+          setRole(staffMember.role);
+          setAccessDiagnostic(`Роль подтверждена в Realtime Database (${staffMember.role}).`);
         }
-
-        const rtdbStaff = await rtdbGet<StaffMember>(`staff/${currentUser.uid}`).catch(() => null);
-        if (rtdbStaff && rtdbStaff.email?.trim().toLowerCase() === tokenEmail) {
-          setRole(rtdbStaff.role);
-          setAccessDiagnostic(`Роль подтверждена (${rtdbStaff.role}).`);
-          setSecondFactor(await isSecondFactorSession(currentUser));
-          setLoading(false);
-          return;
-        }
-
-        // Check local staff storage
-        const localStaffList = loadLocal<StaffMember[]>("staff", []);
-        const foundLocal = localStaffList.find((s) => s.email.trim().toLowerCase() === tokenEmail);
-        if (foundLocal) {
-          setRole(foundLocal.role);
-          setAccessDiagnostic(`Роль подтверждена (${foundLocal.role}).`);
-          setSecondFactor(true);
-          setLoading(false);
-          return;
-        }
-
-        // Unauthorized
-        setRole(null);
-        setAccessDiagnostic("Доступ запрещён. Ваш аккаунт не авторизован в CRM F Launcher.");
+        setSecondFactor(await isSecondFactorSession(currentUser));
       } catch (checkErr) {
         console.warn("Auth role check error:", checkErr);
         setRole(null);
+        setError(errorText(checkErr));
       } finally {
         setLoading(false);
       }
@@ -236,9 +174,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!user || (!secondFactor && !bypassMfa) || !role) return;
+    if (!user || !secondFactor || !role) return;
     void loadPage(page);
-  }, [user, secondFactor, bypassMfa, role, page]);
+  }, [user, secondFactor, role, page]);
 
   async function loadPage(target: Page) {
     setBusy(true);
@@ -256,12 +194,10 @@ export default function App() {
         if (rtdbCampaigns) {
           const list = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
           setCampaigns(list);
-          saveLocal("campaigns", list);
         }
         if (rtdbErrors) {
           const list = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
           setErrors(list);
-          saveLocal("errors", list);
         }
 
         const dailyList = rtdbDaily ? Object.entries(rtdbDaily).map(([id, val]) => ({ ...val, id })) : [];
@@ -280,7 +216,6 @@ export default function App() {
         if (rtdbCampaigns) {
           const list = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
           setCampaigns(list);
-          saveLocal("campaigns", list);
         }
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
@@ -296,7 +231,6 @@ export default function App() {
             status: rtdbBans && rtdbBans[uid] ? "BANNED" : p.status || "ACTIVE",
           }));
           setPlayers(list);
-          saveLocal("players", list);
         }
       }
 
@@ -305,7 +239,6 @@ export default function App() {
         if (rtdbErrors) {
           const list = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
           setErrors(list);
-          saveLocal("errors", list);
         }
       }
 
@@ -314,43 +247,15 @@ export default function App() {
         if (rtdbNews) {
           const list = Object.entries(rtdbNews).map(([id, val]) => ({ ...val, id }));
           setAnnouncements(list);
-          saveLocal("news", list);
         }
       }
 
       if (target === "staff") {
         const rtdbStaff = await rtdbGet<Record<string, StaffMember>>("staff").catch(() => null);
-        const map = new Map<string, StaffMember>();
-
-        // Always put Chief on top
-        map.set(PRIMARY_CHIEF_EMAIL.toLowerCase(), {
-          id: "chief",
-          email: PRIMARY_CHIEF_EMAIL,
-          displayName: "Главный администратор",
-          role: "owner",
-          isChief: true,
-          createdAt: Date.now(),
-        });
-
-        // Add locally cached staff
-        loadLocal<StaffMember[]>("staff", []).forEach((s) => map.set(s.email.toLowerCase(), s));
-
-        // Add from RTDB
-        if (rtdbStaff) {
-          Object.entries(rtdbStaff).forEach(([id, s]) => {
-            if (s && s.email) {
-              map.set(s.email.toLowerCase(), {
-                ...s,
-                id,
-                isChief: s.email.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase(),
-              });
-            }
-          });
-        }
-
-        const merged = Array.from(map.values());
-        setStaff(merged);
-        saveLocal("staff", merged);
+        const rows = rtdbStaff
+          ? Object.entries(rtdbStaff).map(([id, member]) => ({ ...member, id }))
+          : [];
+        setStaff(rows);
       }
 
       if (target === "audit") {
@@ -360,11 +265,11 @@ export default function App() {
             .map(([id, val]) => ({ ...val, id }))
             .sort((a, b) => (b.at || 0) - (a.at || 0));
           setAudit(list);
-          saveLocal("audit", list);
         }
       }
     } catch (err) {
       console.warn("loadPage error:", err);
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }
@@ -380,14 +285,10 @@ export default function App() {
           .filter((k) => k.campaignId === campaignId);
         if (list.length > 0) {
           setKeys(list);
-          saveLocal("keys", list);
           return;
         }
       }
-      // Fallback to locally saved keys for this campaign
-      const localKeys = loadLocal<ZbtKey[]>("keys", []);
-      const filtered = localKeys.filter((k) => k.campaignId === campaignId);
-      setKeys(filtered);
+      setKeys([]);
     } catch (cause) {
       console.warn("Error loading keys:", cause);
     }
@@ -436,41 +337,33 @@ export default function App() {
   async function inviteStaff(event: FormEvent) {
     event.preventDefault();
     const email = inviteEmail.trim().toLowerCase();
-    if (!email) return;
+    const uid = inviteUid.trim();
+    if (!email || !uid || !user || role !== "owner") return;
 
-    const staffDocId = `staff_${email.replace(/[^a-zA-Z0-9]/g, "_")}`;
     const newStaffMember: StaffMember = {
-      id: staffDocId,
+      id: uid,
       email,
       role: inviteRole,
       displayName: email.split("@")[0],
       createdAt: Date.now(),
-      invitedBy: user?.email || "owner",
+      invitedBy: user.uid,
     };
-
-    // 1. Optimistic instant UI update!
-    setStaff((prev) => {
-      const updated = [newStaffMember, ...prev.filter((s) => s.email.toLowerCase() !== email)];
-      saveLocal("staff", updated);
-      return updated;
-    });
-
-    setInviteEmail("");
-    setShowInviteForm(false);
-    setNotice(`Сотрудник ${email} успешно добавлен в список с ролью ${inviteRole}!`);
-
-    // 2. Async RTDB write
-    const res = await rtdbSet(`staff/${staffDocId}`, newStaffMember);
+    const res = await rtdbSet(`staff/${uid}`, newStaffMember);
     if (!res.success) {
-      setError(`Внимание: Realtime Database вернула ошибку (${res.error || "PERMISSION_DENIED"}). Откройте «База RTDB» вверху для настройки правил.`);
-    } else {
-      await rtdbSet(`auditLog/audit_${Date.now()}`, {
-        actorUid: user?.uid || "owner",
-        action: "invite_staff",
-        payload: { email, role: inviteRole },
-        at: Date.now(),
-      });
+      setError(`Не удалось сохранить staff/${uid}: ${res.error || "проверьте правила RTDB"}`);
+      return;
     }
+    await rtdbSet(`auditLog/audit_${Date.now()}`, {
+      actorUid: user.uid,
+      action: "invite_staff",
+      payload: { uid, email, role: inviteRole },
+      at: Date.now(),
+    });
+    setStaff((prev) => [newStaffMember, ...prev.filter((member) => member.id !== uid)]);
+    setInviteEmail("");
+    setInviteUid("");
+    setShowInviteForm(false);
+    setNotice(`Доступ для ${email} сохранён в RTDB по UID ${uid}.`);
   }
 
   // OPTIMISTIC: Ban or unban player
@@ -483,36 +376,35 @@ export default function App() {
 
     if (!window.confirm(confirmMessage)) return;
 
-    // 1. Optimistic instant update
-    setPlayers((prev) => {
-      const updated = prev.map((p) => (p.uid === player.uid ? { ...p, status: newStatus } : p));
-      saveLocal("players", updated);
-      return updated;
-    });
-
-    setNotice(`Игрок ${player.nickname || player.uid}: ${isBanning ? "ЗАБЛОКИРОВАН" : "РАЗБЛОКИРОВАН"}`);
-
-    // 2. Async RTDB write
-    await rtdbUpdate(`players/${player.uid}`, { status: newStatus, updatedAt: Date.now() });
     if (isBanning) {
-      await rtdbSet(`bans/${player.uid}`, {
+      const result = await rtdbSet(`bans/${player.uid}`, {
         uid: player.uid,
         nickname: player.nickname || "",
-        contactEmail: player.contactEmail || "",
         bannedAt: Date.now(),
-        bannedBy: user?.email || "admin",
+        bannedBy: user?.uid || "unknown",
         reason: "Блокировка администратором CRM",
       });
+      if (!result.success) {
+        setError(`Не удалось сохранить бан в RTDB: ${result.error || "отказано правилами"}`);
+        return;
+      }
     } else {
-      await rtdbRemove(`bans/${player.uid}`);
+      const result = await rtdbRemove(`bans/${player.uid}`);
+      if (!result.success) {
+        setError(`Не удалось снять бан в RTDB: ${result.error || "отказано правилами"}`);
+        return;
+      }
     }
 
-    await rtdbSet(`auditLog/audit_${Date.now()}`, {
-      actorUid: user?.uid || "owner",
+    setPlayers((prev) => prev.map((item) => item.uid === player.uid ? { ...item, status: newStatus } : item));
+    setNotice(`Игрок ${player.nickname || player.uid}: ${isBanning ? "ЗАБЛОКИРОВАН" : "РАЗБЛОКИРОВАН"}`);
+    const auditResult = await rtdbSet(`auditLog/audit_${Date.now()}`, {
+      actorUid: user?.uid || "unknown",
       action: isBanning ? "ban_player" : "unban_player",
       payload: { uid: player.uid, nickname: player.nickname, status: newStatus },
       at: Date.now(),
     });
+    if (!auditResult.success) setError(`Статус игрока изменён, но журнал не записан: ${auditResult.error || "ошибка RTDB"}`);
   }
 
   // OPTIMISTIC: Create ZBT Campaign & Keys
@@ -520,163 +412,58 @@ export default function App() {
     event.preventDefault();
     setBusy(true);
     setError("");
-
-    const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
-    const campaignId = `zbt_${Date.now()}`;
-    const generatedKeys: string[] = [];
-    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-    for (let i = 0; i < campaignSeats; i++) {
-      let p1 = "", p2 = "", p3 = "";
-      for (let j = 0; j < 4; j++) p1 += alphabet[Math.floor(Math.random() * alphabet.length)];
-      for (let j = 0; j < 4; j++) p2 += alphabet[Math.floor(Math.random() * alphabet.length)];
-      for (let j = 0; j < 4; j++) p3 += alphabet[Math.floor(Math.random() * alphabet.length)];
-      generatedKeys.push(`FL-${p1}-${p2}-${p3}`);
-    }
-
-    const campaignPayload: Campaign = {
-      id: campaignId,
-      name: campaignName,
-      seats: campaignSeats,
-      status: "ACTIVE",
-      activatedCount: 0,
-      createdAt: Date.now(),
-      expiresAt: expiresAtMs,
-    };
-
-    const newKeysList: ZbtKey[] = generatedKeys.map((rawKey) => {
-      const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
-      return {
-        id: keyHash,
+    try {
+      const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
+      const campaignId = `zbt_${crypto.randomUUID()}`;
+      const generatedKeys = Array.from({ length: campaignSeats }, makeZbtKey);
+      const createdAt = Date.now();
+      const campaignPayload: Campaign = {
+        id: campaignId,
+        name: campaignName.trim(),
+        seats: campaignSeats,
+        status: "ACTIVE",
+        activatedCount: 0,
+        createdAt,
+        expiresAt: expiresAtMs,
+      };
+      const newKeysList: ZbtKey[] = await Promise.all(generatedKeys.map(async (rawKey) => ({
+        id: await hashZbtKey(rawKey),
         campaignId,
         status: "UNUSED",
-        rawKey,
-        createdAt: Date.now(),
-      };
-    });
+        createdAt,
+      })));
+      const keyBatch = Object.fromEntries(newKeysList.map((item) => [item.id, {
+        campaignId,
+        campaignName: campaignPayload.name,
+        status: item.status,
+        createdAt,
+        expiresAt: expiresAtMs,
+      }]));
 
-    // 1. Local state & storage update so keys are never lost
-    setCampaigns((prev) => {
-      const updated = [campaignPayload, ...prev];
-      saveLocal("campaigns", updated);
-      return updated;
-    });
-
-    setKeys((prev) => {
-      const updated = [...newKeysList, ...prev];
-      saveLocal("keys", updated);
-      return updated;
-    });
-    setSelectedCampaign(campaignId);
-
-    // 2. Download CSV immediately
-    const csvContent = "index,key,campaign,status\n" + generatedKeys.map((k, idx) => `${idx + 1},${k},${campaignName},UNUSED`).join("\n");
-    const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(file);
-    link.download = `${campaignName.replace(/[^\p{L}\p{N}-]+/gu, "-")}-keys.csv`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-
-    // 3. Prepare Realtime Database batches
-    const rtdbKeyBatch: Record<string, unknown> = {};
-    const rtdbFlatKeyBatch: Record<string, unknown> = {};
-    for (const k of newKeysList) {
-      rtdbKeyBatch[k.id] = k;
-      if (k.rawKey) {
-        rtdbFlatKeyBatch[k.rawKey] = {
-          campaignId,
-          campaignName,
-          status: "UNUSED",
-          createdAt: Date.now(),
-          rawKey: k.rawKey,
-        };
+      const campaignWrite = await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
+      if (!campaignWrite.success) throw new Error(campaignWrite.error || "Не удалось сохранить кампанию.");
+      const keyWrite = await rtdbUpdate("zbtKeys", keyBatch);
+      if (!keyWrite.success) {
+        await rtdbRemove(`zbtCampaigns/${campaignId}`);
+        throw new Error(keyWrite.error || "Не удалось сохранить хеши ключей.");
       }
-    }
 
-    // 4. Await RTDB writes and verify responses
-    const campWrite = await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
-    await rtdbSet(`campaigns/${campaignId}`, campaignPayload);
-    const keysWrite = await rtdbUpdate("zbtKeys", rtdbKeyBatch);
-    const flatKeysWrite = await rtdbUpdate("keys", rtdbFlatKeyBatch);
-
-    setBusy(false);
-
-    if (campWrite.success && keysWrite.success) {
-      setNotice(`✅ Кампания «${campaignName}» и ${campaignSeats} ключей успешно записаны в Realtime Database (/zbtCampaigns, /zbtKeys, /keys)!`);
+      setCampaigns((previous) => [campaignPayload, ...previous]);
+      setKeys((previous) => [...newKeysList, ...previous]);
+      setSelectedCampaign(campaignId);
+      localStorage.removeItem(STORAGE_PREFIX + "keys");
+      const csvContent = "index,key,campaign,status\n" + generatedKeys.map((key, index) => `${index + 1},${key},${campaignPayload.name},UNUSED`).join("\n");
+      const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(file);
+      link.download = `${campaignPayload.name.replace(/[^\p{L}\p{N}-]+/gu, "-")}-keys.csv`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setNotice("Кампания и хеши ключей записаны. Открытые ключи доступны только в скачанном CSV.");
       setCampaignName("");
       setShowCampaignForm(false);
-    } else {
-      const writeErr = campWrite.error || keysWrite.error || flatKeysWrite.error || "PERMISSION_DENIED";
-      setError(
-        `⚠️ Realtime Database отклонила запись (${writeErr}). В консоли Firebase в разделе Rules включите правила доступа! Ключи сохранены в браузере и CSV.`
-      );
-      setShowDbModal(true);
-    }
-  }
-
-  // Bulk sync all local campaigns & keys into Realtime Database
-  async function syncAllToRtdb() {
-    setBusy(true);
-    setError("");
-    setNotice("");
-
-    try {
-      const localCampaigns = loadLocal<Campaign[]>("campaigns", campaigns);
-      const localKeys = loadLocal<ZbtKey[]>("keys", keys);
-
-      let campCount = 0;
-      let lastErr = "";
-
-      for (const camp of localCampaigns) {
-        const res = await rtdbSet(`zbtCampaigns/${camp.id}`, camp);
-        await rtdbSet(`campaigns/${camp.id}`, camp);
-        if (res.success) {
-          campCount++;
-        } else {
-          lastErr = res.error || "PERMISSION_DENIED";
-        }
-      }
-
-      if (localKeys.length > 0) {
-        const keyBatch: Record<string, unknown> = {};
-        const flatBatch: Record<string, unknown> = {};
-        for (const k of localKeys) {
-          const raw = k.rawKey || k.id;
-          const keyHash = `hash_${raw.replace(/[^A-Za-z0-9]/g, "")}`;
-          keyBatch[keyHash] = {
-            id: keyHash,
-            campaignId: k.campaignId,
-            status: k.status || "UNUSED",
-            rawKey: raw,
-            createdAt: k.createdAt || k.activatedAt || Date.now(),
-          };
-          flatBatch[raw] = {
-            campaignId: k.campaignId,
-            status: k.status || "UNUSED",
-            createdAt: k.createdAt || k.activatedAt || Date.now(),
-          };
-        }
-        const resKeys = await rtdbUpdate("zbtKeys", keyBatch);
-        await rtdbUpdate("keys", flatBatch);
-        if (!resKeys.success) {
-          lastErr = resKeys.error || "PERMISSION_DENIED";
-        }
-      }
-
-      if (lastErr) {
-        setError(
-          `Realtime Database отклонила запись (${lastErr}). Откройте вкладку Rules в Firebase Console и опубликуйте открытые правила!`
-        );
-        setShowDbModal(true);
-      } else {
-        setNotice(
-          `✅ Успешная синхронизация: ${campCount} кампаний и ${localKeys.length} ключей записаны в Realtime Database (/zbtCampaigns, /zbtKeys, /keys)! Проверьте консоль Firebase.`
-        );
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(`Ошибка при синхронизации: ${msg}`);
+    } catch (cause) {
+      setError(errorText(cause));
     } finally {
       setBusy(false);
     }
@@ -698,7 +485,6 @@ export default function App() {
     // 1. Optimistic update
     setAnnouncements((prev) => {
       const updated = [payload, ...prev];
-      saveLocal("news", updated);
       return updated;
     });
 
@@ -715,7 +501,6 @@ export default function App() {
   async function setCampaignStatus(campaignId: string, status: string) {
     setCampaigns((prev) => {
       const updated = prev.map((c) => (c.id === campaignId ? { ...c, status } : c));
-      saveLocal("campaigns", updated);
       return updated;
     });
     setNotice(`Статус кампании обновлён: ${status}`);
@@ -726,7 +511,6 @@ export default function App() {
     if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
     setKeys((prev) => {
       const updated = prev.map((k) => (k.id === keyId ? { ...k, status: "REVOKED" } : k));
-      saveLocal("keys", updated);
       return updated;
     });
     setNotice("Ключ ЗБТ отозван.");
@@ -736,7 +520,6 @@ export default function App() {
   async function updateError(errorItem: CrmError, status: string) {
     setErrors((prev) => {
       const updated = prev.map((e) => (e.id === errorItem.id ? { ...e, status } : e));
-      saveLocal("errors", updated);
       return updated;
     });
     setNotice(`Статус ошибки обновлён: ${status}`);
@@ -756,23 +539,11 @@ export default function App() {
     });
   }
 
-  // 1-Click Initialize entire database structure in RTDB
+  // Initialize public configuration and starter content; staff is seeded by a project administrator.
   async function initRtdbStructure() {
     setBusy(true);
     try {
       const now = Date.now();
-      // Write /admin
-      await rtdbSet("admin", PRIMARY_CHIEF_EMAIL);
-
-      // Write /staff
-      await rtdbSet(`staff/chief`, {
-        email: PRIMARY_CHIEF_EMAIL,
-        displayName: "Главный администратор",
-        role: "owner",
-        isChief: true,
-        createdAt: now,
-      });
-
       // Write /config
       await rtdbSet("config", {
         launcherVersion: "1.0.0",
@@ -788,7 +559,7 @@ export default function App() {
         body: "База данных успешно настроена и подключена.",
         status: "PUBLISHED",
         updatedAt: now,
-        author: PRIMARY_CHIEF_EMAIL,
+        author: user?.email || "admin",
       });
 
       // Run check again
@@ -809,7 +580,6 @@ export default function App() {
     setOverview(null);
     setNotice("");
     setError("");
-    setBypassMfa(false);
   }
 
   if (loading) {
@@ -838,7 +608,7 @@ export default function App() {
     );
   }
 
-  if (!secondFactor && !bypassMfa) {
+  if (!secondFactor) {
     return (
       <MfaScreen
         phone={phone}
@@ -849,7 +619,6 @@ export default function App() {
         start={startMfaEnrollment}
         finish={finishMfaEnrollment}
         onSignOut={signOutUser}
-        onBypass={() => setBypassMfa(true)}
         error={error}
         notice={notice}
       />
@@ -874,7 +643,7 @@ export default function App() {
     `${item.title || ""} ${item.area || ""} ${item.status || ""}`.toLowerCase().includes(queryText.toLowerCase())
   );
 
-  const isChiefUser = user.email?.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase();
+  const isChiefUser = role === "owner";
 
   return (
     <div className="app-shell">
@@ -909,14 +678,14 @@ export default function App() {
             <span>
               {isChiefUser ? "Главный администратор" : "Сотрудник CRM"}
               <br />
-              <b>{isChiefUser ? PRIMARY_CHIEF_EMAIL : user.email}</b>
+              <b>{user.email}</b>
             </span>
           </div>
           <button className="profile-row" onClick={signOutUser} title="Выйти из CRM">
             <span className="avatar">{(user.displayName || user.email || "A").slice(0, 1).toUpperCase()}</span>
             <span className="profile-copy">
               <b>{user.displayName || user.email}</b>
-              <small>{isChiefUser ? "Owner (Chief)" : role}</small>
+              <small>{role}</small>
             </span>
             <LogOut size={15} />
           </button>
@@ -995,38 +764,6 @@ export default function App() {
             </div>
           </div>
 
-          {rtdbDiag.tested && !rtdbDiag.canWrite && (
-            <div className="rtdb-warning-banner">
-              <AlertTriangle size={18} />
-              <div className="rtdb-warning-text">
-                <b>Внимание: Realtime Database работает в закрытом режиме (.write: false).</b>
-                <span>
-                  В консоли Firebase запрещена запись. Созданные ключи и кампании сохраняются только локально в браузере и не отображаются в консоли Firebase (<code>data/~2F</code>).
-                </span>
-              </div>
-              <div className="rtdb-warning-actions">
-                <button className="button primary" onClick={() => setShowDbModal(true)}>
-                  <Lock size={13} /> Открыть правила RTDB
-                </button>
-                <a
-                  href={RTDB_RULES_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="button secondary"
-                >
-                  Вставить в Firebase <ExternalLink size={12} />
-                </a>
-                <button
-                  className="button secondary"
-                  onClick={() => void runRtdbDiagnostics()}
-                  disabled={rtdbDiag.testing}
-                  title="Проверить доступ после сохранения правил в Firebase"
-                >
-                  <RefreshCw size={12} className={rtdbDiag.testing ? "spin" : ""} /> Проверить
-                </button>
-              </div>
-            </div>
-          )}
 
           {notice && (
             <div className="notice success">
@@ -1065,10 +802,7 @@ export default function App() {
               revoke={revokeKey}
               role={role}
               onCreateCampaign={() => setShowCampaignForm(true)}
-              onSyncAll={syncAllToRtdb}
               onOpenDbModal={() => setShowDbModal(true)}
-              isSyncing={busy}
-              canWrite={rtdbDiag.canWrite}
               copiedKey={copiedKey}
               setCopiedKey={setCopiedKey}
             />
@@ -1161,6 +895,15 @@ export default function App() {
         <Modal title="Пригласить сотрудника в CRM" close={() => setShowInviteForm(false)}>
           <form className="form-stack" onSubmit={inviteStaff}>
             <label>
+              Firebase Auth UID
+              <input
+                required
+                value={inviteUid}
+                onChange={(event) => setInviteUid(event.target.value)}
+                placeholder="UID из Authentication → Users"
+              />
+            </label>
+            <label>
               Google-почта сотрудника
               <input
                 required
@@ -1179,7 +922,7 @@ export default function App() {
               </select>
             </label>
             <p className="form-hint">
-              Сотрудник мгновенно добавится в список и сможет войти через свой Google-аккаунт.
+              Документ будет создан как staff/{inviteUid || "UID"}. Email должен совпадать с Google-аккаунтом этого UID.
             </p>
             <div className="modal-actions">
               <button className="button secondary" type="button" onClick={() => setShowInviteForm(false)}>
@@ -1299,27 +1042,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Bulk Data Sync to RTDB */}
-            <div style={{ border: "1px solid #d9e6dc", background: "#fbfcf9", borderRadius: "6px", padding: "12px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                <strong style={{ fontSize: "11px", color: "#226946", display: "flex", alignItems: "center", gap: "6px" }}>
-                  <UploadCloud size={15} /> Отправить ключи и кампании в RTDB
-                </strong>
-                <button
-                  type="button"
-                  className="button primary"
-                  style={{ minHeight: "28px", padding: "0 10px", fontSize: "10px" }}
-                  onClick={() => void syncAllToRtdb()}
-                  disabled={busy}
-                >
-                  {busy ? <RefreshCw size={12} className="spin" /> : <UploadCloud size={12} />} Синхронизировать
-                </button>
-              </div>
-              <p style={{ margin: 0, fontSize: "10px", color: "#687569", lineHeight: 1.4 }}>
-                Если ключи создавались до настройки правил, эта кнопка принудительно запишет все {campaigns.length} кампаний и {keys.length} ключей в ветки <b>/zbtCampaigns</b>, <b>/zbtKeys</b> и <b>/keys</b>.
-              </p>
-            </div>
-
             {/* Rules Configuration */}
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
@@ -1332,8 +1054,7 @@ export default function App() {
                     type="button"
                     className="small-button"
                     onClick={() => {
-                      const text = rulesTab === "dev" ? DEV_TEST_RTDB_RULES : RECOMMENDED_RTDB_RULES;
-                      void navigator.clipboard.writeText(text);
+                      void navigator.clipboard.writeText(RECOMMENDED_RTDB_RULES);
                       setCopiedRules(true);
                       setTimeout(() => setCopiedRules(false), 2000);
                     }}
@@ -1352,31 +1073,11 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Rules tabs */}
-              <div className="rules-tabs">
-                <button
-                  type="button"
-                  className={`tab-btn ${rulesTab === "dev" ? "active" : ""}`}
-                  onClick={() => setRulesTab("dev")}
-                >
-                  ⚡ Быстрый режим (Тестовый .write: true)
-                </button>
-                <button
-                  type="button"
-                  className={`tab-btn ${rulesTab === "prod" ? "active" : ""}`}
-                  onClick={() => setRulesTab("prod")}
-                >
-                  🛡️ Рабочий режим (auth != null)
-                </button>
-              </div>
-
               <p className="form-hint" style={{ marginBottom: "6px" }}>
-                {rulesTab === "dev"
-                  ? "Для немедленного сохранения: откройте ссылку «Вставить в Rules», замените правила на этот JSON и нажмите Publish."
-                  : "Для рабочего сервера: разрешает запись авторизованным сотрудникам и игрокам."}
+                В рабочем режиме чтение ограничено ролями RTDB staff и MFA. Не включайте публичные правила .read/.write: true.
               </p>
               <pre style={{ margin: 0, padding: "10px", background: "#1c2e22", color: "#c8e89f", borderRadius: "5px", fontSize: "9px", overflowX: "auto", fontFamily: "ui-monospace, monospace" }}>
-                {rulesTab === "dev" ? DEV_TEST_RTDB_RULES : RECOMMENDED_RTDB_RULES}
+                {RECOMMENDED_RTDB_RULES}
               </pre>
             </div>
 
@@ -1437,7 +1138,7 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
           <span>Realtime Database · Строгая RBAC защита</span>
         </div>
         <small className="login-footer">
-          Главный администратор: {PRIMARY_CHIEF_EMAIL}. Неавторизованные лица блокируются сервером.
+          Роль сотрудника проверяется по RTDB staff/{"UID"}; MFA обязательна.
         </small>
         <div id="mfa-recaptcha" />
       </div>
@@ -1475,7 +1176,7 @@ function AccessScreen({
           Аккаунт <b>{email}</b> (UID: {uid.slice(0, 8)}...) не имеет прав доступа к панели управления F Launcher.
         </p>
         <div style={{ padding: "12px", background: "#f5f7f3", borderRadius: "6px", fontSize: "10px", color: "#627063", margin: "14px 0", textAlign: "left" }}>
-          Для получения доступа обратитесь к главному администратору: <b>{PRIMARY_CHIEF_EMAIL}</b>. Самостоятельная выдача прав заблокирована в целях безопасности.
+          {diagnostic || `Проверьте документ RTDB staff/${uid}: email должен совпадать, роль — owner, support или marketing.`}
         </div>
         {error && <div className="notice danger" style={{ marginTop: "10px" }}><span>{error}</span></div>}
         <button className="button secondary wide" onClick={onSignOut} style={{ marginTop: "8px" }}>
@@ -1496,7 +1197,6 @@ function MfaScreen(props: {
   start: () => void;
   finish: () => void;
   onSignOut: () => void;
-  onBypass: () => void;
   error: string;
   notice: string;
 }) {
@@ -1509,7 +1209,7 @@ function MfaScreen(props: {
         <p className="eyebrow">ЗАЩИТА СЕССИИ</p>
         <h1>Двухфакторная проверка</h1>
         <p>
-          Подтвердите вход через SMS или войдите в режиме подтверждённого главного администратора.
+          Подтвердите вход через SMS, чтобы открыть CRM.
         </p>
         {props.error && (
           <div className="notice danger">
@@ -1552,13 +1252,6 @@ function MfaScreen(props: {
             </button>
           </>
         )}
-        <button
-          className="button secondary wide"
-          style={{ marginTop: "12px" }}
-          onClick={props.onBypass}
-        >
-          Войти как Главный Администратор
-        </button>
         <button className="text-button" onClick={props.onSignOut}>
           Выйти из аккаунта
         </button>
@@ -1696,10 +1389,7 @@ function ZbtPage(props: {
   revoke: (id: string) => void;
   role: Role;
   onCreateCampaign: () => void;
-  onSyncAll: () => Promise<void>;
   onOpenDbModal: () => void;
-  isSyncing?: boolean;
-  canWrite?: boolean;
   copiedKey: string;
   setCopiedKey: (k: string) => void;
 }) {
@@ -1719,32 +1409,8 @@ function ZbtPage(props: {
           >
             <Lock size={12} /> Правила RTDB
           </button>
-          <button
-            className="button primary"
-            style={{ height: "30px", fontSize: "10px", padding: "0 10px" }}
-            onClick={() => void props.onSyncAll()}
-            disabled={props.isSyncing}
-            title="Принудительно записать все созданные ключи и кампании в консоль Firebase (/zbtCampaigns, /zbtKeys, /keys)"
-          >
-            <UploadCloud size={13} className={props.isSyncing ? "spin" : ""} />
-            {props.isSyncing ? "Синхронизация..." : "Отправить всё в RTDB"}
-          </button>
         </div>
       </div>
-
-      {props.canWrite === false && (
-        <div style={{ padding: "10px 14px", background: "#fdf8ea", border: "1px solid #f2db9b", borderRadius: "6px", marginBottom: "16px", fontSize: "11px", color: "#7a5813", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
-          <div>
-            <b>⚠️ Запись в базу заблокирована (.write: false).</b>
-            <div style={{ fontSize: "10px", marginTop: "2px" }}>
-              Ключи создаются в браузере, но не появляются в Firebase Console (<code>data/~2F</code>), пока вы не опубликуете правила.
-            </div>
-          </div>
-          <button className="button primary" style={{ minHeight: "26px", fontSize: "10px", flexShrink: 0 }} onClick={props.onOpenDbModal}>
-            <Lock size={12} /> Настроить правила
-          </button>
-        </div>
-      )}
 
       <div className="table-wrap">
         <table>
@@ -2202,7 +1868,7 @@ function StaffPage({
       </div>
       <div className="role-strip">
         <span>
-          <b>Owner (Chief)</b> Главный администратор ({PRIMARY_CHIEF_EMAIL}), полный контроль
+          <b>Owner</b> Полный контроль CRM
         </span>
         <span>
           <b>Support</b> Игроки, баны и разбор ошибок
@@ -2223,7 +1889,7 @@ function StaffPage({
           </thead>
           <tbody>
             {staff.map((member) => {
-              const isChief = member.email?.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase() || member.isChief;
+              const isChief = member.role === "owner";
               return (
                 <tr key={member.id || member.email} style={isChief ? { background: "#f8fbf6" } : {}}>
                   <td>
@@ -2232,7 +1898,7 @@ function StaffPage({
                   </td>
                   <td>
                     <span className={`role-pill ${member.role === "owner" ? "owner" : ""}`}>
-                      {isChief ? "Chief Owner" : member.role}
+                      {member.role}
                     </span>
                   </td>
                   <td>
