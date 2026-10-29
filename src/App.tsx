@@ -21,7 +21,6 @@ type StaffMember = { id: string; email: string; displayName?: string; role: Role
 type AuditEntry = { id: string; actorUid: string; action: string; payload: Record<string, unknown>; at?: number };
 type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> };
 
-const founderEmail = "a60840397@gmail.com";
 const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "overview", label: "Обзор", icon: LayoutDashboard },
   { id: "zbt", label: "ЗБТ-ключи", icon: KeyRound },
@@ -86,12 +85,7 @@ export default function App() {
     if (!currentUser) { setLoading(false); return; }
     try {
       const identity = await call<{ role?: Role; email?: string }>("whoAmI");
-      if (currentUser.email?.toLowerCase() === founderEmail) {
-        await call("bootstrapOwner");
-        await currentUser.getIdToken(true);
-      }
-      const refreshed = await call<{ role?: Role; email?: string }>("whoAmI");
-      setRole(refreshed.role ?? identity.role ?? null);
+      setRole(identity.role ?? null);
       setSecondFactor(await isSecondFactorSession(currentUser));
     } catch (cause) {
       setError(errorText(cause));
@@ -242,7 +236,7 @@ export default function App() {
 
   if (loading) return <div className="boot"><span className="loader" />Проверяем защищённую сессию</div>;
   if (!user) return <LoginScreen onSignIn={signIn} error={error} />;
-  if (!role) return <AccessScreen email={user.email || ""} error={error} onSignOut={signOutUser} />;
+  if (!role) return <AccessScreen email={user.email || ""} uid={user.uid} error={error} onSignOut={signOutUser} />;
   if (!secondFactor) return <MfaScreen
     phone={phone} setPhone={setPhone} code={smsCode} setCode={setSmsCode}
     sent={Boolean(mfaVerificationId)} start={startMfaEnrollment} finish={finishMfaEnrollment}
@@ -309,7 +303,7 @@ export default function App() {
         {page === "errors" && <ErrorsPage errors={filteredErrors} query={query} setQuery={setQuery} updateStatus={updateError} />}
         {page === "news" && <NewsPage announcements={announcements} />}
         {page === "analytics" && <AnalyticsPage overview={overview} />}
-        {page === "staff" && <StaffPage staff={staff} role={role} />}
+        {page === "staff" && <StaffPage staff={staff} />}
         {page === "audit" && <AuditPage entries={audit} />}
       </section>
     </main>
@@ -356,8 +350,8 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
   </div>;
 }
 
-function AccessScreen({ email, error, onSignOut }: { email: string; error: string; onSignOut: () => void }) {
-  return <div className="gate-screen"><div className="gate-box"><div className="gate-icon"><ShieldAlert size={25} /></div><p className="eyebrow">ДОСТУП НЕ ВЫДАН</p><h1>Аккаунт не добавлен</h1><p>{error || `Для ${email} нет активной роли CRM. Попросите основателя добавить вас в разделе «Сотрудники».`}</p><button className="button secondary" onClick={onSignOut}><LogOut size={15} /> Выйти</button></div><div id="mfa-recaptcha" /></div>;
+function AccessScreen({ email, uid, error, onSignOut }: { email: string; uid: string; error: string; onSignOut: () => void }) {
+  return <div className="gate-screen"><div className="gate-box"><div className="gate-icon"><ShieldAlert size={25} /></div><p className="eyebrow">ДОСТУП НЕ ВЫДАН</p><h1>Нет записи сотрудника</h1><p>{error || `Для ${email} не найден документ staff/${uid} в Firestore. Администратор проекта должен создать эту запись и назначить роль.`}</p><button className="button secondary" onClick={onSignOut}><LogOut size={15} /> Выйти</button></div><div id="mfa-recaptcha" /></div>;
 }
 
 function MfaScreen(props: { phone: string; setPhone: (v: string) => void; code: string; setCode: (v: string) => void; sent: boolean; start: () => void; finish: () => void; onSignOut: () => void; error: string; notice: string }) {
@@ -434,10 +428,10 @@ function AnalyticsPage({ overview }: { overview: Overview | null }) {
   </div>;
 }
 
-function StaffPage({ staff, role }: { staff: StaffMember[]; role: Role }) {
+function StaffPage({ staff }: { staff: StaffMember[] }) {
   return <div className="data-section"><div className="section-head"><div><p className="eyebrow">ACCESS CONTROL</p><h2>Сотрудники и роли</h2></div><span className="subtle">Доступ выдаёт только owner</span></div>
     <div className="role-strip"><span><b>Owner</b> полный доступ и роли</span><span><b>Support</b> игроки и ошибки</span><span><b>Marketing</b> новости</span><span><b>2FA</b> SMS-фактор обязателен</span></div>
-    <div className="table-wrap"><table><thead><tr><th>СОТРУДНИК</th><th>РОЛЬ</th><th>ДОСТУП</th></tr></thead><tbody>{staff.filter((member) => member.email.toLowerCase() !== founderEmail).map((member) => <tr key={member.id}><td><b>{member.displayName || member.email}</b><small className="cell-id">{member.email}</small></td><td><span className="role-pill">{member.role}</span></td><td><span className="permission-check"><Check size={14} /> Firebase claim</span></td></tr>)}<tr><td><b>{founderEmail}</b><small className="cell-id">Главный основатель</small></td><td><span className="role-pill owner">owner</span></td><td><span className="permission-check"><Check size={14} /> {role === "owner" ? "Вы" : "Firebase claim"}</span></td></tr></tbody></table></div>
+    <div className="table-wrap"><table><thead><tr><th>СОТРУДНИК</th><th>РОЛЬ</th><th>ДОСТУП</th></tr></thead><tbody>{staff.map((member) => <tr key={member.id}><td><b>{member.displayName || member.email}</b><small className="cell-id">{member.email}</small></td><td><span className={`role-pill ${member.role === "owner" ? "owner" : ""}`}>{member.role}</span></td><td><span className="permission-check"><Check size={14} /> Firestore role</span></td></tr>)}</tbody></table></div>
   </div>;
 }
 
