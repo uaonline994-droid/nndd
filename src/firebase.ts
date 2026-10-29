@@ -15,11 +15,25 @@ import {
 } from "firebase/auth";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import { getFirestore } from "firebase/firestore";
+import {
+  getDatabase,
+  ref,
+  set,
+  get,
+  update,
+  remove,
+  child,
+  push,
+  onValue,
+  type Database,
+} from "firebase/database";
+
+const RTDB_URL = "https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyCbAfAp4_AydyvWZZ7CyzvLKNM_iTltTYM",
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "furry-launcher.firebaseapp.com",
-  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL || "https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app",
+  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL || RTDB_URL,
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "furry-launcher",
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "furry-launcher.firebasestorage.app",
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "1040994944020",
@@ -29,9 +43,48 @@ const firebaseConfig = {
 export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const rtdb: Database = getDatabase(app, RTDB_URL);
 export const functions = getFunctions(app, "europe-west1");
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
+
+// Realtime Database helpers for F Launcher sync
+export async function rtdbSet(path: string, data: unknown) {
+  try {
+    await set(ref(rtdb, path), data);
+  } catch (err) {
+    console.warn(`RTDB set error at ${path}:`, err);
+  }
+}
+
+export async function rtdbUpdate(path: string, data: object) {
+  try {
+    await update(ref(rtdb, path), data);
+  } catch (err) {
+    console.warn(`RTDB update error at ${path}:`, err);
+  }
+}
+
+export async function rtdbRemove(path: string) {
+  try {
+    await remove(ref(rtdb, path));
+  } catch (err) {
+    console.warn(`RTDB remove error at ${path}:`, err);
+  }
+}
+
+export async function rtdbGet<T>(path: string): Promise<T | null> {
+  try {
+    const snapshot = await get(ref(rtdb, path));
+    if (snapshot.exists()) {
+      return snapshot.val() as T;
+    }
+    return null;
+  } catch (err) {
+    console.warn(`RTDB get error at ${path}:`, err);
+    return null;
+  }
+}
 
 export async function call<T>(name: string, data?: Record<string, unknown>): Promise<T> {
   const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
@@ -100,4 +153,16 @@ export async function isSecondFactorSession(user: User): Promise<boolean> {
   }
 }
 
-export { multiFactor, signOut, RecaptchaVerifier };
+export {
+  multiFactor,
+  signOut,
+  RecaptchaVerifier,
+  ref as rtdbRef,
+  set as rtdbRawSet,
+  get as rtdbRawGet,
+  update as rtdbRawUpdate,
+  remove as rtdbRawRemove,
+  onValue as rtdbOnValue,
+  push as rtdbPush,
+  child as rtdbChild,
+};
