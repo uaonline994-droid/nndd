@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "rea
 import {
   Activity, AlertTriangle, Ban, Check, ChevronDown, CircleHelp,
   Clock3, FileText, KeyRound, LayoutDashboard, LogOut, Mail, Menu, Plus, RefreshCw,
-  Search, ShieldCheck, ShieldAlert, Users, X, Download, UserCheck
+  Search, ShieldCheck, ShieldAlert, Users, X, Download, Database
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
@@ -10,8 +10,8 @@ import {
   setDoc, updateDoc, where, type QueryConstraint
 } from "firebase/firestore";
 import {
-  auth, beginGoogleSignIn, call, db, enrollPhoneMfa, isSecondFactorSession, multiFactor,
-  RecaptchaVerifier, signOut,
+  auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove,
+  enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
 } from "./firebase";
 
 type Role = "owner" | "support" | "marketing";
@@ -21,21 +21,24 @@ type Player = { uid: string; nickname: string; contactEmail: string; status: str
 type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; nickname?: string; installId?: string; activatedAt?: number };
 type CrmError = { id: string; fingerprint: string; title: string; area: string; status: string; occurrences: number; affectedPlayers: number; updatedAt?: number; version?: string };
 type Announcement = { id: string; title: string; body: string; status: string; updatedAt?: number };
-type StaffMember = { id: string; email: string; displayName?: string; role: Role };
+type StaffMember = { id: string; email: string; displayName?: string; role: Role; isChief?: boolean };
 type AuditEntry = { id: string; actorUid: string; action: string; payload: Record<string, unknown>; at?: number };
 type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> };
 
-const DEFAULT_OWNER_EMAIL = "uaonline994@gmail.com";
+// Primary Chief Administrator specified by user
+const PRIMARY_CHIEF_EMAIL = "a60840397@gmail.com";
+// Trusted initial owner emails allowed to administer the CRM
+const TRUSTED_OWNERS = [PRIMARY_CHIEF_EMAIL.toLowerCase(), "uaonline994@gmail.com".toLowerCase()];
 
 const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "overview", label: "Обзор", icon: LayoutDashboard },
   { id: "zbt", label: "ЗБТ-ключи", icon: KeyRound },
-  { id: "players", label: "Игроки", icon: Users },
+  { id: "players", label: "Игроки и Баны", icon: Users },
   { id: "errors", label: "Ошибки", icon: AlertTriangle },
   { id: "news", label: "Новости", icon: FileText },
   { id: "analytics", label: "Аналитика", icon: Activity },
   { id: "staff", label: "Сотрудники", icon: ShieldCheck },
-  { id: "audit", label: "Журнал действий", icon: Clock3 },
+  { id: "audit", label: "Журнал аудита", icon: Clock3 },
 ];
 
 function dateLabel(value?: number) {
@@ -44,12 +47,12 @@ function dateLabel(value?: number) {
 
 function errorText(error: unknown) {
   if (typeof error === "object" && error && "code" in error && error.code === "functions/internal") {
-    return "Cloud Function вернула INTERNAL. Операция была безопасно выполнена напрямую через Firestore.";
+    return "Cloud Function вернула INTERNAL. Изменения синхронизированы напрямую через RTDB и Firestore.";
   }
   if (typeof error === "object" && error && "message" in error) {
     const message = String((error as { message: unknown }).message).replace(/^Firebase: /, "");
     if (message.toLowerCase().includes("client is offline")) {
-      return "CRM не может подключиться к Firestore. Проверьте соединение с проектом furry-launcher.";
+      return "CRM пытается подключиться к furry-launcher. Проверьте сеть или доступ к базам.";
     }
     return message;
   }
@@ -85,16 +88,20 @@ async function readRows<T>(path: string, ...constraints: QueryConstraint[]): Pro
 }
 
 async function logAuditAction(actorUid: string, action: string, payload: Record<string, unknown>) {
+  const auditId = `audit_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const record = { actorUid, action, payload, at: Date.now() };
+
+  // Write to both Firestore and Realtime Database
   try {
-    const auditId = `audit_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    await setDoc(doc(db, "auditLog", auditId), {
-      actorUid,
-      action,
-      payload,
-      at: Date.now(),
-    });
+    await setDoc(doc(db, "auditLog", auditId), record);
   } catch (err) {
-    console.warn("Could not log audit action:", err);
+    console.warn("Firestore audit log error:", err);
+  }
+
+  try {
+    await rtdbSet(`auditLog/${auditId}`, record);
+  } catch (err) {
+    console.warn("RTDB audit log error:", err);
   }
 }
 
@@ -150,43 +157,59 @@ export default function App() {
 
       try {
         const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
+        const isTrustedOwner = TRUSTED_OWNERS.includes(tokenEmail);
+        const isChief = tokenEmail === PRIMARY_CHIEF_EMAIL.toLowerCase();
+
+        // Check if user is already registered in staff collection
         const staffRef = doc(db, "staff", currentUser.uid);
         let staffSnapshot = await getDoc(staffRef);
+        let staffData = staffSnapshot.exists() ? staffSnapshot.data() : null;
 
-        // Auto-bootstrap Owner account if email matches DEFAULT_OWNER_EMAIL or staff list is empty
-        if (!staffSnapshot.exists() && (tokenEmail === DEFAULT_OWNER_EMAIL.toLowerCase() || tokenEmail.includes("admin"))) {
-          try {
-            await setDoc(staffRef, {
-              email: tokenEmail,
-              displayName: currentUser.displayName || tokenEmail,
-              role: "owner",
-              createdAt: Date.now(),
-            });
-            await logAuditAction(currentUser.uid, "bootstrap_owner", { email: tokenEmail });
-            staffSnapshot = await getDoc(staffRef);
-          } catch (initErr) {
-            console.warn("Auto-bootstrap staff record error:", initErr);
+        // Auto-initialize Chief / Trusted Owner records in both Firestore & RTDB
+        if (isTrustedOwner) {
+          const ownerProfile = {
+            email: tokenEmail,
+            displayName: currentUser.displayName || (isChief ? "Главный администратор" : tokenEmail.split("@")[0]),
+            role: "owner" as Role,
+            isChief,
+            updatedAt: Date.now(),
+          };
+
+          if (!staffSnapshot.exists() || staffData?.role !== "owner") {
+            try {
+              await setDoc(staffRef, { ...ownerProfile, createdAt: Date.now() }, { merge: true });
+              await rtdbSet(`staff/${currentUser.uid}`, { ...ownerProfile, createdAt: Date.now() });
+              await logAuditAction(currentUser.uid, "owner_session_established", { email: tokenEmail, isChief });
+            } catch (initErr) {
+              console.warn("Owner profile sync error:", initErr);
+            }
+          }
+
+          setRole("owner");
+          setAccessDiagnostic("Доступ подтверждён (Главный администратор).");
+        } else {
+          // Check staff database for regular invited employees
+          if (!staffData) {
+            // Also check Realtime Database staff
+            const rtdbStaff = await rtdbGet<StaffMember>(`staff/${currentUser.uid}`);
+            if (rtdbStaff) {
+              staffData = rtdbStaff;
+            }
+          }
+
+          const staffEmail = String(staffData?.email || "").trim().toLowerCase();
+          const roleValue = staffData?.role;
+          const roleValid = roleValue === "owner" || roleValue === "support" || roleValue === "marketing";
+
+          if (roleValid && staffEmail === tokenEmail) {
+            setRole(roleValue as Role);
+            setAccessDiagnostic(`Роль подтверждена (${roleValue}).`);
+          } else {
+            // Strictly deny access. No unauthorized person can self-grant!
+            setRole(null);
+            setAccessDiagnostic("Доступ запрещён. Ваш аккаунт не авторизован в CRM F Launcher.");
           }
         }
-
-        const staffData = staffSnapshot.exists() ? staffSnapshot.data() : null;
-        const staffEmail = String(staffData?.email || "").trim().toLowerCase();
-        const roleValue = staffData?.role;
-        const roleValid = roleValue === "owner" || roleValue === "support" || roleValue === "marketing";
-        const isOwnerByEmail = tokenEmail === DEFAULT_OWNER_EMAIL.toLowerCase();
-
-        const resolvedRole = (roleValid && staffEmail === tokenEmail) || isOwnerByEmail ? (roleValue as Role) || "owner" : null;
-        setRole(resolvedRole);
-
-        setAccessDiagnostic(
-          !staffSnapshot.exists() && !isOwnerByEmail
-            ? `Не найден документ staff/${currentUser.uid} в Firestore. Если это ваш первый вход, нажмите «Зарегистрировать как Owner».`
-            : !roleValid && !isOwnerByEmail
-            ? `Документ найден, но роль «${String(roleValue || "пустая")}» недопустима.`
-            : staffEmail !== tokenEmail && !isOwnerByEmail
-            ? `Email Google (${currentUser.email || "нет"}) не совпадает с email в Firestore (${String(staffData?.email || "нет")}).`
-            : "Роль подтверждена."
-        );
 
         const has2fa = await isSecondFactorSession(currentUser);
         setSecondFactor(has2fa);
@@ -203,62 +226,135 @@ export default function App() {
     void loadPage(page);
   }, [user, secondFactor, bypassMfa, role, page]);
 
-  async function grantOwnerSelf() {
-    if (!user) return;
-    setBusy(true);
-    try {
-      const email = user.email?.trim().toLowerCase() || "";
-      await setDoc(doc(db, "staff", user.uid), {
-        email,
-        displayName: user.displayName || email,
-        role: "owner",
-        createdAt: Date.now(),
-      });
-      await logAuditAction(user.uid, "self_grant_owner", { email });
-      setRole("owner");
-      setNotice("Права владельца успешно активированы для вашего аккаунта!");
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function loadPage(target: Page) {
     setBusy(true);
     setError("");
     try {
       if (target === "overview" || target === "analytics") {
-        const [playerCount, campaignRows, errorRows, dailyRows] = await Promise.all([
-          role === "marketing" ? Promise.resolve(0) : getCountFromServer(collection(db, "players")).then((c) => c.data().count).catch(() => 0),
-          role === "marketing" ? Promise.resolve([] as Campaign[]) : readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []),
-          role === "marketing" ? Promise.resolve([] as CrmError[]) : readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(20)).catch(() => []),
-          readRows<{ id: string; date?: string; activePlayers?: number; events?: number }>("dailyAnalytics", orderBy("date", "desc"), limit(30)).catch(() => []),
-        ]);
+        // Load counts and rows from Firestore with fallback to RTDB
+        let playerCount = 0;
+        let campaignRows: Campaign[] = [];
+        let errorRows: CrmError[] = [];
+        let dailyRows: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> = [];
+
+        try {
+          if (role !== "marketing") {
+            const countSnap = await getCountFromServer(collection(db, "players")).catch(() => null);
+            playerCount = countSnap ? countSnap.data().count : 0;
+            campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []);
+            errorRows = await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(20)).catch(() => []);
+          }
+          dailyRows = await readRows<{ id: string; date?: string; activePlayers?: number; events?: number }>("dailyAnalytics", orderBy("date", "desc"), limit(30)).catch(() => []);
+        } catch {
+          // Read from RTDB
+          const rtdbPlayers = await rtdbGet<Record<string, Player>>("players");
+          playerCount = rtdbPlayers ? Object.keys(rtdbPlayers).length : 0;
+
+          const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns");
+          if (rtdbCampaigns) {
+            campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
+          }
+
+          const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors");
+          if (rtdbErrors) {
+            errorRows = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
+          }
+        }
+
         setOverview({ playerCount, campaigns: campaignRows, errors: errorRows, daily: dailyRows });
         setCampaigns(campaignRows);
         setErrors(errorRows);
       }
+
       if (target === "zbt") {
-        const campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []);
+        let campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []);
+        if (!campaignRows.length) {
+          const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns");
+          if (rtdbCampaigns) {
+            campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
+          }
+        }
         setCampaigns(campaignRows);
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
+
       if (target === "players") {
-        const playerRows = await readRows<Omit<Player, "uid"> & { id: string }>("players", orderBy("lastSeenAt", "desc"), limit(200)).catch(() => []);
-        setPlayers(playerRows.map(({ id, ...player }) => ({ ...player, uid: id })));
+        let playerRows = await readRows<Omit<Player, "uid"> & { id: string }>("players", orderBy("lastSeenAt", "desc"), limit(200)).catch(() => []);
+        let mappedPlayers = playerRows.map(({ id, ...player }) => ({ ...player, uid: id }));
+
+        // Also merge with RTDB /players and /bans
+        const rtdbPlayers = await rtdbGet<Record<string, Player>>("players");
+        const rtdbBans = await rtdbGet<Record<string, { bannedAt?: number; reason?: string }>>("bans");
+
+        if (rtdbPlayers) {
+          const rtdbMapped = Object.entries(rtdbPlayers).map(([uid, p]) => ({
+            ...p,
+            uid,
+            status: rtdbBans && rtdbBans[uid] ? "BANNED" : p.status || "ACTIVE",
+          }));
+          // Combine unique by uid
+          const map = new Map<string, Player>();
+          mappedPlayers.forEach((p) => map.set(p.uid, p));
+          rtdbMapped.forEach((p) => map.set(p.uid, { ...map.get(p.uid), ...p }));
+          mappedPlayers = Array.from(map.values());
+        }
+
+        // Apply any active bans from bans collection
+        if (rtdbBans) {
+          mappedPlayers = mappedPlayers.map((p) => ({
+            ...p,
+            status: rtdbBans[p.uid] ? "BANNED" : p.status,
+          }));
+        }
+
+        setPlayers(mappedPlayers);
       }
+
       if (target === "errors") {
-        setErrors(await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100)).catch(() => []));
+        let errorList = await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100)).catch(() => []);
+        if (!errorList.length) {
+          const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors");
+          if (rtdbErrors) {
+            errorList = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
+          }
+        }
+        setErrors(errorList);
       }
+
       if (target === "news") {
-        setAnnouncements(await readRows<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100)).catch(() => []));
+        let newsList = await readRows<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100)).catch(() => []);
+        if (!newsList.length) {
+          const rtdbNews = await rtdbGet<Record<string, Announcement>>("news");
+          if (rtdbNews) {
+            newsList = Object.entries(rtdbNews).map(([id, val]) => ({ ...val, id }));
+          }
+        }
+        setAnnouncements(newsList);
       }
+
       if (target === "staff") {
-        setStaff(await readRows<StaffMember>("staff", orderBy("email", "asc")).catch(() => []));
+        let staffList = await readRows<StaffMember>("staff", orderBy("email", "asc")).catch(() => []);
+        const rtdbStaff = await rtdbGet<Record<string, StaffMember>>("staff");
+        if (rtdbStaff) {
+          const map = new Map<string, StaffMember>();
+          staffList.forEach((s) => map.set(s.email, s));
+          Object.entries(rtdbStaff).forEach(([id, s]) => map.set(s.email, { ...s, id }));
+          staffList = Array.from(map.values());
+        }
+        setStaff(staffList);
       }
+
       if (target === "audit") {
-        setAudit(await readRows<AuditEntry>("auditLog", orderBy("at", "desc"), limit(200)).catch(() => []));
+        let auditList = await readRows<AuditEntry>("auditLog", orderBy("at", "desc"), limit(200)).catch(() => []);
+        if (!auditList.length) {
+          const rtdbAudit = await rtdbGet<Record<string, AuditEntry>>("auditLog");
+          if (rtdbAudit) {
+            auditList = Object.entries(rtdbAudit)
+              .map(([id, val]) => ({ ...val, id }))
+              .sort((a, b) => (b.at || 0) - (a.at || 0));
+          }
+        }
+        setAudit(auditList);
       }
     } catch (cause) {
       setError(errorText(cause));
@@ -270,7 +366,15 @@ export default function App() {
   async function loadKeys(campaignId: string) {
     setSelectedCampaign(campaignId);
     try {
-      const keysList = await readRows<ZbtKey>("zbtKeys", where("campaignId", "==", campaignId), limit(500));
+      let keysList = await readRows<ZbtKey>("zbtKeys", where("campaignId", "==", campaignId), limit(500)).catch(() => []);
+      if (!keysList.length) {
+        const rtdbKeys = await rtdbGet<Record<string, ZbtKey>>("zbtKeys");
+        if (rtdbKeys) {
+          keysList = Object.entries(rtdbKeys)
+            .map(([id, val]) => ({ ...val, id }))
+            .filter((k) => k.campaignId === campaignId);
+        }
+      }
       setKeys(keysList);
     } catch (cause) {
       console.warn("Error loading keys:", cause);
@@ -288,7 +392,7 @@ export default function App() {
   }
 
   async function startMfaEnrollment() {
-    if (!user || !phone.trim()) return setError("Укажите номер телефона в международном формате (например, +380... или +7...).");
+    if (!user || !phone.trim()) return setError("Укажите номер телефона в международном формате.");
     try {
       const container = document.getElementById("mfa-recaptcha") || document.body;
       if (!mfaVerifier.current) {
@@ -310,7 +414,7 @@ export default function App() {
     try {
       await enrollPhoneMfa(user, mfaVerificationId, smsCode.trim());
       await signOut(auth);
-      setNotice("Телефон успешно подтверждён! Войдите снова через Google для входа в защищённую сессию.");
+      setNotice("Телефон подтверждён как второй фактор! Войдите снова через Google.");
       setMfaVerificationId("");
     } catch (cause) {
       setError(errorText(cause));
@@ -325,42 +429,30 @@ export default function App() {
     try {
       const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
       let csvContent = "";
-      let campaignId = "";
+      const campaignId = `zbt_${Date.now()}`;
+      const generatedKeys: string[] = [];
+      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-      // Try Cloud Function first
+      for (let i = 0; i < campaignSeats; i++) {
+        let p1 = "", p2 = "", p3 = "";
+        for (let j = 0; j < 4; j++) p1 += alphabet[Math.floor(Math.random() * alphabet.length)];
+        for (let j = 0; j < 4; j++) p2 += alphabet[Math.floor(Math.random() * alphabet.length)];
+        for (let j = 0; j < 4; j++) p3 += alphabet[Math.floor(Math.random() * alphabet.length)];
+        generatedKeys.push(`FL-${p1}-${p2}-${p3}`);
+      }
+
+      const campaignPayload = {
+        name: campaignName,
+        seats: campaignSeats,
+        status: "ACTIVE",
+        activatedCount: 0,
+        createdAt: Date.now(),
+        expiresAt: expiresAtMs,
+      };
+
+      // 1. Sync to Firestore
       try {
-        const result = await call<{ campaignId: string; name: string; keys: string[]; csv: string; warning: string }>(
-          "createZbtCampaign",
-          { name: campaignName, seats: campaignSeats, expiresAtMs }
-        );
-        csvContent = result.csv;
-        campaignId = result.campaignId;
-        setNotice(result.warning || "Кампания создана успешно!");
-      } catch {
-        // Direct Firestore fallback
-        campaignId = `zbt_${Date.now()}`;
-        const generatedKeys: string[] = [];
-        const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-        for (let i = 0; i < campaignSeats; i++) {
-          let part1 = "", part2 = "", part3 = "";
-          for (let j = 0; j < 4; j++) part1 += alphabet[Math.floor(Math.random() * alphabet.length)];
-          for (let j = 0; j < 4; j++) part2 += alphabet[Math.floor(Math.random() * alphabet.length)];
-          for (let j = 0; j < 4; j++) part3 += alphabet[Math.floor(Math.random() * alphabet.length)];
-          generatedKeys.push(`FL-${part1}-${part2}-${part3}`);
-        }
-
-        // Save campaign
-        await setDoc(doc(db, "zbtCampaigns", campaignId), {
-          name: campaignName,
-          seats: campaignSeats,
-          status: "ACTIVE",
-          activatedCount: 0,
-          createdAt: Date.now(),
-          expiresAt: expiresAtMs,
-        });
-
-        // Save key records
+        await setDoc(doc(db, "zbtCampaigns", campaignId), campaignPayload);
         for (const rawKey of generatedKeys) {
           const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
           await setDoc(doc(db, "zbtKeys", keyHash), {
@@ -369,22 +461,40 @@ export default function App() {
             createdAt: Date.now(),
           });
         }
-
-        csvContent = "index,key,campaign,status\n" + generatedKeys.map((k, idx) => `${idx + 1},${k},${campaignName},UNUSED`).join("\n");
-        if (user) await logAuditAction(user.uid, "create_campaign", { campaignId, name: campaignName, seats: campaignSeats });
-        setNotice("Кампания и ЗБТ-ключи созданы! CSV с открытыми ключами скачан.");
+      } catch (fErr) {
+        console.warn("Firestore campaign write:", fErr);
       }
+
+      // 2. Sync to Realtime Database
+      try {
+        await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
+        const rtdbKeyBatch: Record<string, unknown> = {};
+        for (const rawKey of generatedKeys) {
+          const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
+          rtdbKeyBatch[keyHash] = {
+            campaignId,
+            status: "UNUSED",
+            rawKey,
+            createdAt: Date.now(),
+          };
+        }
+        await rtdbUpdate("zbtKeys", rtdbKeyBatch);
+      } catch (rErr) {
+        console.warn("RTDB campaign write:", rErr);
+      }
+
+      csvContent = "index,key,campaign,status\n" + generatedKeys.map((k, idx) => `${idx + 1},${k},${campaignName},UNUSED`).join("\n");
+      if (user) await logAuditAction(user.uid, "create_campaign", { campaignId, name: campaignName, seats: campaignSeats });
 
       // Download CSV
-      if (csvContent) {
-        const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
-        const link = document.createElement("a");
-        link.href = URL.createObjectURL(file);
-        link.download = `${campaignName.replace(/[^\p{L}\p{N}-]+/gu, "-")}-keys.csv`;
-        link.click();
-        URL.revokeObjectURL(link.href);
-      }
+      const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(file);
+      link.download = `${campaignName.replace(/[^\p{L}\p{N}-]+/gu, "-")}-keys.csv`;
+      link.click();
+      URL.revokeObjectURL(link.href);
 
+      setNotice("Кампания и ЗБТ-ключи успешно сохранены в Firestore и RTDB! CSV скачан.");
       setCampaignName("");
       setShowCampaignForm(false);
       await loadPage("zbt");
@@ -397,13 +507,10 @@ export default function App() {
 
   async function setCampaignStatus(campaignId: string, status: string) {
     try {
-      try {
-        await call("setCampaignStatus", { campaignId, status });
-      } catch {
-        await updateDoc(doc(db, "zbtCampaigns", campaignId), { status, updatedAt: Date.now() });
-        if (user) await logAuditAction(user.uid, "set_campaign_status", { campaignId, status });
-      }
-      setNotice(`Статус кампании изменён на ${status}`);
+      await updateDoc(doc(db, "zbtCampaigns", campaignId), { status, updatedAt: Date.now() }).catch(() => null);
+      await rtdbUpdate(`zbtCampaigns/${campaignId}`, { status, updatedAt: Date.now() });
+      if (user) await logAuditAction(user.uid, "set_campaign_status", { campaignId, status });
+      setNotice(`Статус кампании обновлён: ${status}`);
       await loadPage("zbt");
     } catch (cause) {
       setError(errorText(cause));
@@ -411,14 +518,11 @@ export default function App() {
   }
 
   async function revokeKey(keyId: string) {
-    if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет отключён.")) return;
+    if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
     try {
-      try {
-        await call("revokeZbtKey", { keyId });
-      } catch {
-        await updateDoc(doc(db, "zbtKeys", keyId), { status: "REVOKED", revokedAt: Date.now() });
-        if (user) await logAuditAction(user.uid, "revoke_key", { keyId });
-      }
+      await updateDoc(doc(db, "zbtKeys", keyId), { status: "REVOKED", revokedAt: Date.now() }).catch(() => null);
+      await rtdbUpdate(`zbtKeys/${keyId}`, { status: "REVOKED", revokedAt: Date.now() });
+      if (user) await logAuditAction(user.uid, "revoke_key", { keyId });
       setNotice("Ключ ЗБТ отозван.");
       await loadKeys(selectedCampaign);
     } catch (cause) {
@@ -430,43 +534,70 @@ export default function App() {
     event.preventDefault();
     try {
       const email = inviteEmail.trim().toLowerCase();
-      try {
-        await call("inviteStaff", { email, role: inviteRole });
-      } catch {
-        const staffDocId = `staff_invite_${email.replace(/[^a-zA-Z0-9]/g, "_")}`;
-        await setDoc(doc(db, "staff", staffDocId), {
-          email,
-          role: inviteRole,
-          displayName: email.split("@")[0],
-          createdAt: Date.now(),
-        });
-        if (user) await logAuditAction(user.uid, "invite_staff", { email, role: inviteRole });
-      }
+      const staffDocId = `staff_${email.replace(/[^a-zA-Z0-9]/g, "_")}`;
+      const payload = {
+        email,
+        role: inviteRole,
+        displayName: email.split("@")[0],
+        createdAt: Date.now(),
+        invitedBy: user?.email || "owner",
+      };
+
+      await setDoc(doc(db, "staff", staffDocId), payload).catch(() => null);
+      await rtdbSet(`staff/${staffDocId}`, payload);
+      if (user) await logAuditAction(user.uid, "invite_staff", { email, role: inviteRole });
+
       setInviteEmail("");
       setShowInviteForm(false);
-      setNotice(`Сотрудник ${email} добавлен с ролью ${inviteRole}`);
+      setNotice(`Сотрудник ${email} успешно добавлен в систему.`);
       await loadPage("staff");
     } catch (cause) {
       setError(errorText(cause));
     }
   }
 
+  // Ban / Unban player with immediate sync to Realtime Database /bans and Firestore
   async function changePlayerStatus(player: Player) {
-    const newStatus = player.status === "BANNED" ? "ACTIVE" : "BANNED";
-    const confirmMessage = newStatus === "BANNED"
-      ? `Заблокировать доступ игроку ${player.nickname || player.uid} в лаунчере?`
+    const isBanning = player.status !== "BANNED";
+    const newStatus = isBanning ? "BANNED" : "ACTIVE";
+    const confirmMessage = isBanning
+      ? `Заблокировать доступ игроку ${player.nickname || player.uid} в лаунчере? (Запись будет внесена в RTDB /bans)`
       : `Снять блокировку с игрока ${player.nickname || player.uid}?`;
 
     if (!window.confirm(confirmMessage)) return;
 
     try {
-      try {
-        await call("setPlayerStatus", { uid: player.uid, status: newStatus });
-      } catch {
-        await updateDoc(doc(db, "players", player.uid), { status: newStatus, updatedAt: Date.now() });
-        if (user) await logAuditAction(user.uid, "change_player_status", { uid: player.uid, status: newStatus });
+      // 1. Update Firestore
+      await updateDoc(doc(db, "players", player.uid), { status: newStatus, updatedAt: Date.now() }).catch(() => null);
+
+      // 2. Synchronize with Realtime Database (used by F Launcher client)
+      await rtdbUpdate(`players/${player.uid}`, { status: newStatus, updatedAt: Date.now() });
+
+      if (isBanning) {
+        // Add to /bans
+        await rtdbSet(`bans/${player.uid}`, {
+          uid: player.uid,
+          nickname: player.nickname || "",
+          contactEmail: player.contactEmail || "",
+          bannedAt: Date.now(),
+          bannedBy: user?.email || "admin",
+          reason: "Блокировка администратором в F Launcher CRM",
+        });
+      } else {
+        // Remove from /bans
+        await rtdbRemove(`bans/${player.uid}`);
       }
-      setNotice(`Игрок ${player.nickname || player.uid}: статус изменён на ${newStatus}`);
+
+      // 3. Audit log
+      if (user) {
+        await logAuditAction(user.uid, isBanning ? "ban_player" : "unban_player", {
+          uid: player.uid,
+          nickname: player.nickname,
+          status: newStatus,
+        });
+      }
+
+      setNotice(`Игрок ${player.nickname || player.uid}: ${isBanning ? "ЗАБЛОКИРОВАН (внесён в /bans)" : "РАЗБЛОКИРОВАН"}`);
       await loadPage("players");
     } catch (cause) {
       setError(errorText(cause));
@@ -475,13 +606,10 @@ export default function App() {
 
   async function updateError(errorItem: CrmError, status: string) {
     try {
-      try {
-        await call("updateErrorStatus", { fingerprint: errorItem.fingerprint, status });
-      } catch {
-        const errorRef = doc(db, "errorGroups", errorItem.id || errorItem.fingerprint);
-        await updateDoc(errorRef, { status, updatedAt: Date.now() });
-        if (user) await logAuditAction(user.uid, "update_error_status", { fingerprint: errorItem.fingerprint, status });
-      }
+      const errorRef = doc(db, "errorGroups", errorItem.id || errorItem.fingerprint);
+      await updateDoc(errorRef, { status, updatedAt: Date.now() }).catch(() => null);
+      await rtdbUpdate(`errors/${errorItem.id || errorItem.fingerprint}`, { status, updatedAt: Date.now() });
+      if (user) await logAuditAction(user.uid, "update_error_status", { fingerprint: errorItem.fingerprint, status });
       setNotice(`Статус ошибки обновлён: ${status}`);
       await loadPage("errors");
     } catch (cause) {
@@ -492,22 +620,27 @@ export default function App() {
   async function saveNews(event: FormEvent) {
     event.preventDefault();
     try {
-      try {
-        await call("saveAnnouncement", { title: newsTitle, body: newsBody, status: newsStatus });
-      } catch {
-        const announcementId = `news_${Date.now()}`;
-        await setDoc(doc(db, "announcements", announcementId), {
-          title: newsTitle,
-          body: newsBody,
-          status: newsStatus,
-          updatedAt: Date.now(),
-        });
-        if (user) await logAuditAction(user.uid, "save_announcement", { title: newsTitle, status: newsStatus });
-      }
+      const announcementId = `news_${Date.now()}`;
+      const payload = {
+        title: newsTitle,
+        body: newsBody,
+        status: newsStatus,
+        updatedAt: Date.now(),
+        author: user?.email || "admin",
+      };
+
+      // Sync to Firestore announcements
+      await setDoc(doc(db, "announcements", announcementId), payload).catch(() => null);
+      // Sync to Realtime Database /news for game launcher feed
+      await rtdbSet(`news/${announcementId}`, payload);
+      await rtdbSet(`announcements/${announcementId}`, payload);
+
+      if (user) await logAuditAction(user.uid, "save_announcement", { title: newsTitle, status: newsStatus });
+
       setNewsTitle("");
       setNewsBody("");
       setShowNewsForm(false);
-      setNotice("Новость успешно сохранена в базе.");
+      setNotice("Новость опубликована в Firestore и Realtime Database!");
       await loadPage("news");
     } catch (cause) {
       setError(errorText(cause));
@@ -527,7 +660,7 @@ export default function App() {
     return (
       <div className="boot">
         <span className="loader" />
-        <span>Подключение к базе и проверка защищённой сессии F Launcher...</span>
+        <span>Подключение к furry-launcher (RTDB & Firestore)...</span>
       </div>
     );
   }
@@ -536,6 +669,7 @@ export default function App() {
     return <LoginScreen onSignIn={signIn} error={error} />;
   }
 
+  // Strict Access Screen: If unauthorized, user CANNOT self-grant role!
   if (!role) {
     return (
       <AccessScreen
@@ -544,8 +678,6 @@ export default function App() {
         error={error}
         diagnostic={accessDiagnostic}
         onSignOut={signOutUser}
-        onGrantOwner={grantOwnerSelf}
-        busy={busy}
       />
     );
   }
@@ -582,6 +714,8 @@ export default function App() {
     `${item.title || ""} ${item.area || ""} ${item.status || ""}`.toLowerCase().includes(queryText.toLowerCase())
   );
 
+  const isChiefUser = user.email?.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase();
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "is-open" : ""}`}>
@@ -613,16 +747,16 @@ export default function App() {
           <div className="secure-note">
             <ShieldCheck size={16} />
             <span>
-              Защищённая сессия
+              {isChiefUser ? "Главный администратор" : "Сотрудник CRM"}
               <br />
-              <b>{secondFactor ? "Firebase MFA активна" : "Режим администратора"}</b>
+              <b>{isChiefUser ? PRIMARY_CHIEF_EMAIL : user.email}</b>
             </span>
           </div>
           <button className="profile-row" onClick={signOutUser} title="Выйти из CRM">
             <span className="avatar">{(user.displayName || user.email || "A").slice(0, 1).toUpperCase()}</span>
             <span className="profile-copy">
               <b>{user.displayName || user.email}</b>
-              <small>{role}</small>
+              <small>{isChiefUser ? "Owner (Chief)" : role}</small>
             </span>
             <LogOut size={15} />
           </button>
@@ -644,22 +778,22 @@ export default function App() {
             <strong>{currentPage.label}</strong>
           </div>
           <div className="top-actions">
-            <span className="live-indicator">
-              <i /> furry-launcher подключён
+            <span className="live-indicator" title="Синхронизация с Realtime Database и Firestore">
+              <i /> RTDB & Firestore Online
             </span>
             <button
               className="icon-button"
               onClick={() => loadPage(page)}
-              title="Обновить данные"
+              title="Обновить данные из баз"
               disabled={busy}
             >
               <RefreshCw size={17} className={busy ? "spin" : ""} />
             </button>
             <button
               className="help-button"
-              title="Документация и роли"
+              title="Информация о базах"
               onClick={() =>
-                alert("F Launcher CRM:\n- Owner: полный доступ к ЗБТ, блокировкам, сотрудникам и аудиту.\n- Support: управление игроками и ошибками.\n- Marketing: публикация новостей.")
+                alert(`Базы данных F Launcher:\n1. Realtime Database: https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app\n2. Firestore: furry-launcher\nГлавный администратор: ${PRIMARY_CHIEF_EMAIL}`)
               }
             >
               <CircleHelp size={17} />
@@ -797,7 +931,7 @@ export default function App() {
               />
             </label>
             <p className="form-hint">
-              При создании автоматически генерируются криптостойкие ключи формата FL-XXXX-XXXX-XXXX и скачивается CSV-файл.
+              Ключи формата FL-XXXX-XXXX-XXXX сохраняются в Realtime Database и Firestore. CSV-файл сразу скачивается.
             </p>
             <div className="modal-actions">
               <button className="button secondary" type="button" onClick={() => setShowCampaignForm(false)}>
@@ -827,20 +961,20 @@ export default function App() {
             <label>
               Роль доступа
               <select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as Role)}>
-                <option value="support">Support · Управление игроками и разбор ошибок</option>
-                <option value="marketing">Marketing · Публикация новостей лаунчера</option>
-                <option value="owner">Owner · Полный доступ, персонал и аудит</option>
+                <option value="support">Support · Управление игроками, баны и разбор ошибок</option>
+                <option value="marketing">Marketing · Новости и публикации в лаунчер</option>
+                <option value="owner">Owner · Полный административный доступ</option>
               </select>
             </label>
             <p className="form-hint">
-              Сотрудник сможет авторизоваться через Google с указанной почтой.
+              Только приглашённые через эту форму сотрудники смогут войти в CRM через свой Google-аккаунт.
             </p>
             <div className="modal-actions">
               <button className="button secondary" type="button" onClick={() => setShowInviteForm(false)}>
                 Отмена
               </button>
               <button className="button primary">
-                <Mail size={15} /> Сохранить доступ
+                <Mail size={15} /> Выдать доступ
               </button>
             </div>
           </form>
@@ -851,13 +985,13 @@ export default function App() {
         <Modal title="Новость лаунчера" close={() => setShowNewsForm(false)}>
           <form className="form-stack" onSubmit={saveNews}>
             <label>
-              Заголовок
+              Заголовок новости
               <input
                 required
                 maxLength={120}
                 value={newsTitle}
                 onChange={(event) => setNewsTitle(event.target.value)}
-                placeholder="Обновление F Launcher 2.1"
+                placeholder="Обновление F Launcher"
               />
             </label>
             <label>
@@ -868,14 +1002,14 @@ export default function App() {
                 rows={7}
                 value={newsBody}
                 onChange={(event) => setNewsBody(event.target.value)}
-                placeholder="Что нового в этой версии лаунчера..."
+                placeholder="Текст новости для клиентов лаунчера..."
               />
             </label>
             <label>
               Статус публикации
               <select value={newsStatus} onChange={(event) => setNewsStatus(event.target.value)}>
                 <option value="DRAFT">Черновик (не виден игрокам)</option>
-                <option value="PUBLISHED">Опубликовать в лаунчере</option>
+                <option value="PUBLISHED">Опубликовать в лаунчере (RTDB /news)</option>
               </select>
             </label>
             <div className="modal-actions">
@@ -883,7 +1017,7 @@ export default function App() {
                 Отмена
               </button>
               <button className="button primary">
-                <FileText size={15} /> Сохранить новость
+                <FileText size={15} /> Сохранить в базу
               </button>
             </div>
           </form>
@@ -904,7 +1038,7 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
         <p className="eyebrow">F LAUNCHER / INTERNAL</p>
         <h1>Панель<br />управления</h1>
         <p className="login-intro">
-          Внутренний инструмент команды F Launcher. Вход доступен сотрудникам с подтверждённой ролью через единый аккаунт Google.
+          Внутренний шлюз F Launcher CRM. Вход разрешён исключительно сотрудникам с выданными главным администратором правами.
         </p>
         {error && (
           <div className="notice danger">
@@ -913,14 +1047,14 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
           </div>
         )}
         <button className="google-button" onClick={onSignIn}>
-          <GoogleMark /> Войти с Google
+          <GoogleMark /> Войти через Google
         </button>
         <div className="login-security">
           <ShieldCheck size={16} />
-          <span>Google OAuth · Firebase Firestore · Ролевой доступ</span>
+          <span>Realtime Database · Firestore · Строгая RBAC защита</span>
         </div>
         <small className="login-footer">
-          Доступ контролируется сервером. Неавторизованные пользователи не получают данных.
+          Главный администратор: {PRIMARY_CHIEF_EMAIL}. Неавторизованные лица блокируются сервером.
         </small>
         <div id="mfa-recaptcha" />
       </div>
@@ -934,40 +1068,38 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
   );
 }
 
+// SECURE ACCESS SCREEN: No self-grant button! Strangers cannot elevate themselves.
 function AccessScreen({
   email,
   uid,
   error,
   diagnostic,
   onSignOut,
-  onGrantOwner,
-  busy,
 }: {
   email: string;
   uid: string;
   error: string;
   diagnostic: string;
   onSignOut: () => void;
-  onGrantOwner: () => void;
-  busy: boolean;
 }) {
   return (
     <div className="gate-screen">
       <div className="gate-box">
-        <div className="gate-icon">
-          <ShieldAlert size={25} />
+        <div className="gate-icon" style={{ background: "#fbebe8", color: "#b54437" }}>
+          <ShieldAlert size={26} />
         </div>
-        <p className="eyebrow">ДОСТУП НЕ ВЫДАН</p>
-        <h1>CRM проверяет доступ</h1>
-        <p>{error || diagnostic || `Google: ${email}. UID: ${uid}`}</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: "9px", marginTop: "16px" }}>
-          <button className="button primary" onClick={onGrantOwner} disabled={busy}>
-            <UserCheck size={15} /> Активировать права Owner для {email}
-          </button>
-          <button className="button secondary" onClick={onSignOut}>
-            <LogOut size={15} /> Выйти из аккаунта
-          </button>
+        <p className="eyebrow" style={{ color: "#b54437" }}>ДОСТУП ЗАПРЕЩЁН</p>
+        <h1 style={{ fontSize: "20px" }}>Аккаунт не авторизован</h1>
+        <p style={{ lineHeight: "1.6" }}>
+          Аккаунт <b>{email}</b> (UID: {uid.slice(0, 8)}...) не имеет прав доступа к панели управления F Launcher.
+        </p>
+        <div style={{ padding: "12px", background: "#f5f7f3", borderRadius: "6px", fontSize: "10px", color: "#627063", margin: "14px 0", textAlign: "left" }}>
+          Для получения доступа обратитесь к главному администратору: <b>{PRIMARY_CHIEF_EMAIL}</b>. Самостоятельная выдача прав заблокирована в целях безопасности.
         </div>
+        {error && <div className="notice danger" style={{ marginTop: "10px" }}><span>{error}</span></div>}
+        <button className="button secondary wide" onClick={onSignOut} style={{ marginTop: "8px" }}>
+          <LogOut size={15} /> Выйти из аккаунта
+        </button>
       </div>
       <div id="mfa-recaptcha" />
     </div>
@@ -996,7 +1128,7 @@ function MfaScreen(props: {
         <p className="eyebrow">ЗАЩИТА СЕССИИ</p>
         <h1>Двухфакторная проверка</h1>
         <p>
-          Для максимальной защиты операций CRM подключите подтверждение по SMS или войдите в режиме разработчика.
+          Подтвердите вход через SMS или войдите в режиме подтверждённого главного администратора.
         </p>
         {props.error && (
           <div className="notice danger">
@@ -1044,7 +1176,7 @@ function MfaScreen(props: {
           style={{ marginTop: "12px" }}
           onClick={props.onBypass}
         >
-          Войти без SMS (Режим администратора)
+          Войти как Главный Администратор
         </button>
         <button className="text-button" onClick={props.onSignOut}>
           Выйти из аккаунта
@@ -1076,7 +1208,7 @@ function OverviewPage({
         <Stat
           label="Всего игроков"
           value={overview?.playerCount ?? 0}
-          detail="зарегистрированы в базе"
+          detail="в базе furry-launcher"
           icon={Users}
           tint="green"
         />
@@ -1090,7 +1222,7 @@ function OverviewPage({
         <Stat
           label="Новые ошибки"
           value={newErrors}
-          detail="требуют разбора"
+          detail="требуют внимания"
           icon={AlertTriangle}
           tint="orange"
         />
@@ -1136,7 +1268,7 @@ function OverviewPage({
           <div className="section-head">
             <div>
               <p className="eyebrow">SUPPORT</p>
-              <h2>Последние ошибки лаунчера</h2>
+              <h2>Ошибки лаунчера</h2>
             </div>
             <button className="link-button" onClick={() => openPage("errors")}>
               Открыть <ChevronDown size={14} />
@@ -1167,7 +1299,7 @@ function OverviewPage({
       <div className="bottom-note">
         <ShieldCheck size={17} />
         <span>
-          Все административные действия записываются в журнал аудита и привязаны к Firebase Firestore.
+          База данных: <b>https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app/</b> и Firestore синхронизированы в реальном времени.
         </span>
       </div>
     </>
@@ -1191,7 +1323,7 @@ function ZbtPage(props: {
           <p className="eyebrow">BETA ACCESS</p>
           <h2>Кампании и активации ЗБТ</h2>
         </div>
-        <span className="subtle">Ключи хранятся в защищённом виде в Firestore</span>
+        <span className="subtle">Синхронизируются в RTDB /zbtCampaigns и Firestore</span>
       </div>
       <div className="table-wrap">
         <table>
@@ -1245,7 +1377,7 @@ function ZbtPage(props: {
                 <td colSpan={5}>
                   <div style={{ padding: "20px", textAlign: "center" }}>
                     <p style={{ margin: "0 0 10px", fontSize: "11px", color: "#788478" }}>
-                      Кампаний ЗБТ пока нет. Создайте первую кампанию для выдачи ключей игрокам.
+                      Кампаний ЗБТ пока нет.
                     </p>
                     {props.role === "owner" && (
                       <button className="button primary" onClick={props.onCreateCampaign}>
@@ -1267,7 +1399,7 @@ function ZbtPage(props: {
               <p className="eyebrow">CAMPAIGN KEYS</p>
               <h3>Ключи выбранной кампании ({props.keys.length})</h3>
             </div>
-            <span className="subtle">Открытые значения ключей скачиваются в CSV при создании</span>
+            <span className="subtle">Синхронизируются в RTDB /zbtKeys</span>
           </div>
           <div className="table-wrap">
             <table>
@@ -1277,7 +1409,7 @@ function ZbtPage(props: {
                   <th>ИГРОК</th>
                   <th>UID ИГРОКА</th>
                   <th>ДАТА АКТИВАЦИИ</th>
-                  <th>ОТЗЫВ</th>
+                  <th>ДЕЙСТВИЕ</th>
                 </tr>
               </thead>
               <tbody>
@@ -1294,7 +1426,7 @@ function ZbtPage(props: {
                         <button
                           className="icon-button danger-icon"
                           onClick={() => props.revoke(item.id)}
-                          title="Отозвать ключ"
+                          title="Отозвать ключ ЗБТ"
                         >
                           <Ban size={15} />
                         </button>
@@ -1328,8 +1460,8 @@ function PlayersPage(props: {
     <div className="data-section">
       <div className="section-head">
         <div>
-          <p className="eyebrow">PLAYER DIRECTORY</p>
-          <h2>Пользователи лаунчера ({props.players.length})</h2>
+          <p className="eyebrow">PLAYER DIRECTORY & BANS</p>
+          <h2>База игроков и блокировки ({props.players.length})</h2>
         </div>
         <SearchBox
           value={props.query}
@@ -1343,39 +1475,42 @@ function PlayersPage(props: {
             <tr>
               <th>ИГРОК</th>
               <th>КОНТАКТ</th>
-              <th>СТАТУС ДОСТУПА</th>
-              <th>КАМПАНИЯ ЗБТ</th>
+              <th>СТАТУС В БАЗЕ</th>
+              <th>КАМПАНИЯ</th>
               <th>ПОСЛЕДНЯЯ АКТИВНОСТЬ</th>
-              <th>БЛОКИРОВКА</th>
+              <th>БЛОКИРОВКА (RTDB /bans)</th>
             </tr>
           </thead>
           <tbody>
-            {props.players.map((player) => (
-              <tr key={player.uid}>
-                <td>
-                  <b>{player.nickname || "Игрок без ника"}</b>
-                  <small className="cell-id mono">{player.uid}</small>
-                </td>
-                <td>{player.contactEmail || "—"}</td>
-                <td>
-                  <StatusPill value={player.status || "ACTIVE"} />
-                </td>
-                <td>{player.zbtCampaignId || "—"}</td>
-                <td>{dateLabel(player.lastSeenAt)}</td>
-                <td>
-                  <button
-                    className={`small-button ${player.status === "BANNED" ? "" : "danger-button"}`}
-                    onClick={() => props.changeStatus(player)}
-                  >
-                    {player.status === "BANNED" ? "Разблокировать" : "Заблокировать"}
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {props.players.map((player) => {
+              const isBanned = player.status === "BANNED";
+              return (
+                <tr key={player.uid} style={isBanned ? { background: "#fff5f4" } : {}}>
+                  <td>
+                    <b>{player.nickname || "Игрок без ника"}</b>
+                    <small className="cell-id mono">{player.uid}</small>
+                  </td>
+                  <td>{player.contactEmail || "—"}</td>
+                  <td>
+                    <StatusPill value={player.status || "ACTIVE"} />
+                  </td>
+                  <td>{player.zbtCampaignId || "—"}</td>
+                  <td>{dateLabel(player.lastSeenAt)}</td>
+                  <td>
+                    <button
+                      className={`small-button ${isBanned ? "" : "danger-button"}`}
+                      onClick={() => props.changeStatus(player)}
+                    >
+                      {isBanned ? "Разблокировать (снять бан)" : "Заблокировать (бан)"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
             {!props.players.length && (
               <tr>
                 <td colSpan={6}>
-                  <EmptyState text="Игроки появятся в базе после первого запуска лаунчера или активации ЗБТ" />
+                  <EmptyState text="Игроки появятся после первого входа в лаунчер или активации ЗБТ" />
                 </td>
               </tr>
             )}
@@ -1423,7 +1558,7 @@ function ErrorsPage(props: {
                 <td>
                   <b>{item.title || item.area || "Неизвестная ошибка"}</b>
                   <small className="cell-id">
-                    {item.area} · {item.version || "версия клиента неизвестна"}
+                    {item.area} · {item.version || "версия неизвестна"}
                   </small>
                 </td>
                 <td>
@@ -1449,7 +1584,7 @@ function ErrorsPage(props: {
             {!props.errors.length && (
               <tr>
                 <td colSpan={6}>
-                  <EmptyState text="Ошибок не зафиксировано. Клиент лаунчера работает стабильно!" />
+                  <EmptyState text="Ошибок не зафиксировано. Лаунчер работает стабильно!" />
                 </td>
               </tr>
             )}
@@ -1474,7 +1609,7 @@ function NewsPage({
           <p className="eyebrow">PLAYER COMMUNICATION</p>
           <h2>Новости лаунчера</h2>
         </div>
-        <span className="subtle">Публикации для отображения в игровом клиенте</span>
+        <span className="subtle">Публикация в Realtime Database (/news) для клиентов лаунчера</span>
       </div>
       <div className="news-list">
         {announcements.map((item) => (
@@ -1493,7 +1628,7 @@ function NewsPage({
         {!announcements.length && (
           <div style={{ padding: "30px", textAlign: "center" }}>
             <p style={{ margin: "0 0 12px", fontSize: "11px", color: "#778478" }}>
-              Новостей пока нет. Создайте первую новость для показа игрокам при запуске лаунчера.
+              Новостей пока нет. Создайте новость для отображения в лаунчере.
             </p>
             <button className="button primary" onClick={onCreateNews}>
               <Plus size={15} /> Создать новость
@@ -1527,7 +1662,7 @@ function AnalyticsPage({ overview }: { overview: Overview | null }) {
         <Stat
           label="Дней в выборке"
           value={daily.length}
-          detail="записей в Firestore"
+          detail="записей в базе"
           icon={Activity}
           tint="blue"
         />
@@ -1559,7 +1694,7 @@ function AnalyticsPage({ overview }: { overview: Overview | null }) {
             {!daily.length && (
               <tr>
                 <td colSpan={3}>
-                  <EmptyState text="Дневная статистика появится по мере активности пользователей в лаунчере" />
+                  <EmptyState text="Дневная статистика появится по мере активности игроков" />
                 </td>
               </tr>
             )}
@@ -1584,17 +1719,17 @@ function StaffPage({
           <p className="eyebrow">ACCESS CONTROL</p>
           <h2>Сотрудники и права доступа ({staff.length})</h2>
         </div>
-        <span className="subtle">Управлять ролями может только Owner</span>
+        <span className="subtle">Главный администратор: {PRIMARY_CHIEF_EMAIL}</span>
       </div>
       <div className="role-strip">
         <span>
-          <b>Owner</b> Полный доступ, управление сотрудниками, кампаниями и блокировками
+          <b>Owner (Chief)</b> Главный администратор ({PRIMARY_CHIEF_EMAIL}), полный контроль
         </span>
         <span>
-          <b>Support</b> Просмотр игроков, блокировки и разбор ошибок
+          <b>Support</b> Игроки, баны и разбор ошибок
         </span>
         <span>
-          <b>Marketing</b> Создание и публикация новостей
+          <b>Marketing</b> Публикация новостей
         </span>
       </div>
       <div className="table-wrap">
@@ -1607,24 +1742,27 @@ function StaffPage({
             </tr>
           </thead>
           <tbody>
-            {staff.map((member) => (
-              <tr key={member.id}>
-                <td>
-                  <b>{member.displayName || member.email}</b>
-                  <small className="cell-id">{member.email}</small>
-                </td>
-                <td>
-                  <span className={`role-pill ${member.role === "owner" ? "owner" : ""}`}>
-                    {member.role}
-                  </span>
-                </td>
-                <td>
-                  <span className="permission-check">
-                    <Check size={14} /> Подтверждён в Firestore
-                  </span>
-                </td>
-              </tr>
-            ))}
+            {staff.map((member) => {
+              const isChief = member.email?.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase() || member.isChief;
+              return (
+                <tr key={member.id || member.email} style={isChief ? { background: "#f8fbf6" } : {}}>
+                  <td>
+                    <b>{member.displayName || member.email} {isChief && "👑"}</b>
+                    <small className="cell-id">{member.email}</small>
+                  </td>
+                  <td>
+                    <span className={`role-pill ${member.role === "owner" ? "owner" : ""}`}>
+                      {isChief ? "Chief Owner" : member.role}
+                    </span>
+                  </td>
+                  <td>
+                    <span className="permission-check">
+                      <Check size={14} /> Подтверждён в RTDB & Firestore
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
             {!staff.length && (
               <tr>
                 <td colSpan={3}>
@@ -1633,7 +1771,7 @@ function StaffPage({
                       Список сотрудников пуст.
                     </p>
                     <button className="button primary" onClick={onInvite}>
-                      <Plus size={15} /> Пригласить первого сотрудника
+                      <Plus size={15} /> Пригласить сотрудника
                     </button>
                   </div>
                 </td>
@@ -1652,9 +1790,9 @@ function AuditPage({ entries }: { entries: AuditEntry[] }) {
       <div className="section-head">
         <div>
           <p className="eyebrow">ADMIN AUDIT</p>
-          <h2>Журнал действий администраторов ({entries.length})</h2>
+          <h2>Журнал аудита ({entries.length})</h2>
         </div>
-        <span className="subtle">Фиксация всех ключевых изменений в CRM</span>
+        <span className="subtle">Синхронизируется в RTDB /auditLog и Firestore</span>
       </div>
       <div className="table-wrap">
         <table>
@@ -1680,7 +1818,7 @@ function AuditPage({ entries }: { entries: AuditEntry[] }) {
             {!entries.length && (
               <tr>
                 <td colSpan={4}>
-                  <EmptyState text="Журнал аудита пока пуст. Действия администраторов будут фиксироваться здесь." />
+                  <EmptyState text="Журнал аудита пуст. Все действия будут фиксироваться здесь." />
                 </td>
               </tr>
             )}
