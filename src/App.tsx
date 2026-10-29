@@ -49,6 +49,7 @@ export default function App() {
   const [secondFactor, setSecondFactor] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [accessDiagnostic, setAccessDiagnostic] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -84,8 +85,23 @@ export default function App() {
     setLoading(true);
     if (!currentUser) { setLoading(false); return; }
     try {
-      const identity = await call<{ role?: Role; email?: string }>("whoAmI");
+      const identity = await call<{
+        role?: Role;
+        email?: string;
+        staffStatus?: string;
+        staffEmail?: string | null;
+        staffRole?: string | null;
+      }>("whoAmI");
       setRole(identity.role ?? null);
+      setAccessDiagnostic(identity.staffStatus === "missing_document"
+        ? `Functions не нашли документ staff/${currentUser.uid}. Проверьте проект и ID документа.`
+        : identity.staffStatus === "invalid_role"
+          ? `Документ найден, но роль «${identity.staffRole || "пустая"}» недопустима. Разрешены owner, support, marketing.`
+          : identity.staffStatus === "email_mismatch"
+            ? `Email в токене (${identity.email || "нет"}) не совпадает с email в staff-документе (${identity.staffEmail || "нет"}).`
+            : identity.staffStatus === "active"
+              ? "Роль распознана, но CRM не открылась. Проверьте MFA и повторно войдите в аккаунт."
+              : "Functions вернули старый формат ответа. Разверните обновлённые Cloud Functions и обновите CRM.");
       setSecondFactor(await isSecondFactorSession(currentUser));
     } catch (cause) {
       setError(errorText(cause));
@@ -236,7 +252,7 @@ export default function App() {
 
   if (loading) return <div className="boot"><span className="loader" />Проверяем защищённую сессию</div>;
   if (!user) return <LoginScreen onSignIn={signIn} error={error} />;
-  if (!role) return <AccessScreen email={user.email || ""} uid={user.uid} error={error} onSignOut={signOutUser} />;
+  if (!role) return <AccessScreen email={user.email || ""} uid={user.uid} error={error} diagnostic={accessDiagnostic} onSignOut={signOutUser} />;
   if (!secondFactor) return <MfaScreen
     phone={phone} setPhone={setPhone} code={smsCode} setCode={setSmsCode}
     sent={Boolean(mfaVerificationId)} start={startMfaEnrollment} finish={finishMfaEnrollment}
@@ -350,8 +366,8 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
   </div>;
 }
 
-function AccessScreen({ email, uid, error, onSignOut }: { email: string; uid: string; error: string; onSignOut: () => void }) {
-  return <div className="gate-screen"><div className="gate-box"><div className="gate-icon"><ShieldAlert size={25} /></div><p className="eyebrow">ДОСТУП НЕ ВЫДАН</p><h1>Нет записи сотрудника</h1><p>{error || `Для ${email} не найден документ staff/${uid} в Firestore. Администратор проекта должен создать эту запись и назначить роль.`}</p><button className="button secondary" onClick={onSignOut}><LogOut size={15} /> Выйти</button></div><div id="mfa-recaptcha" /></div>;
+function AccessScreen({ email, uid, error, diagnostic, onSignOut }: { email: string; uid: string; error: string; diagnostic: string; onSignOut: () => void }) {
+  return <div className="gate-screen"><div className="gate-box"><div className="gate-icon"><ShieldAlert size={25} /></div><p className="eyebrow">ДОСТУП НЕ ВЫДАН</p><h1>CRM не подтвердила доступ</h1><p>{error || diagnostic || `Google: ${email}. UID: ${uid}. Проверьте документ staff/${uid} в Firestore.`}</p><button className="button secondary" onClick={onSignOut}><LogOut size={15} /> Выйти</button></div><div id="mfa-recaptcha" /></div>;
 }
 
 function MfaScreen(props: { phone: string; setPhone: (v: string) => void; code: string; setCode: (v: string) => void; sent: boolean; start: () => void; finish: () => void; onSignOut: () => void; error: string; notice: string }) {
