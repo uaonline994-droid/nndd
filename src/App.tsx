@@ -56,7 +56,7 @@ function timestampMillis(value: unknown): number | undefined {
   return undefined;
 }
 
-function firestoreRow<T extends { id: string }>(id: string, data: Record<string, unknown>): T {
+function firestoreRow<T>(id: string, data: Record<string, unknown>): T {
   return {
     ...data,
     id,
@@ -68,10 +68,10 @@ function firestoreRow<T extends { id: string }>(id: string, data: Record<string,
     publishedAt: timestampMillis(data.publishedAt),
     firstSeenAt: timestampMillis(data.firstSeenAt),
     at: timestampMillis(data.at),
-  } as T;
+  } as unknown as T;
 }
 
-async function readRows<T extends { id: string }>(path: string, ...constraints: QueryConstraint[]): Promise<T[]> {
+async function readRows<T>(path: string, ...constraints: QueryConstraint[]): Promise<T[]> {
   const result = await getDocs(query(collection(db, path), ...constraints));
   return result.docs.map((item) => firestoreRow<T>(item.id, item.data()));
 }
@@ -168,7 +168,10 @@ export default function App() {
         setCampaigns(campaignRows);
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
-      if (target === "players") setPlayers(await readRows<Player>("players", orderBy("lastSeenAt", "desc"), limit(200)));
+      if (target === "players") {
+        const playerRows = await readRows<Omit<Player, "uid"> & { id: string }>("players", orderBy("lastSeenAt", "desc"), limit(200));
+        setPlayers(playerRows.map(({ id, ...player }) => ({ ...player, uid: id })));
+      }
       if (target === "errors") setErrors(await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100)));
       if (target === "news") setAnnouncements(await readRows<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100)));
       if (target === "staff") setStaff(await readRows<StaffMember>("staff", orderBy("email", "asc")));
