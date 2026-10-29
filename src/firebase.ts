@@ -1,4 +1,4 @@
-import { initializeApp } from "firebase/app";
+import { initializeApp, getApps, getApp } from "firebase/app";
 import {
   GoogleAuthProvider,
   getAuth,
@@ -26,52 +26,78 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:1040994944020:web:9a916854f2d6bfd0d99301",
 };
 
-export const app = initializeApp(firebaseConfig);
+export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const functions = getFunctions(app, "europe-west1");
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
-export function call<T>(name: string, data?: Record<string, unknown>) {
-  return httpsCallable<Record<string, unknown>, T>(functions, name)(data ?? {}).then((result) => result.data);
+export async function call<T>(name: string, data?: Record<string, unknown>): Promise<T> {
+  const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
+  const result = await callable(data ?? {});
+  return result.data;
 }
 
 export async function beginGoogleSignIn(): Promise<User | null> {
   try {
-    return (await signInWithPopup(auth, googleProvider)).user;
+    const cred = await signInWithPopup(auth, googleProvider);
+    return cred.user;
   } catch (error) {
     const authError = error as MultiFactorError;
-    if (authError.code !== "auth/multi-factor-auth-required") throw error;
+    if (authError.code !== "auth/multi-factor-auth-required") {
+      throw error;
+    }
     const resolver = getMultiFactorResolver(auth, authError);
-    const phoneHint = resolver.hints.find((hint) => hint.factorId === PhoneMultiFactorGenerator.FACTOR_ID) as PhoneMultiFactorInfo | undefined;
-    if (!phoneHint) throw new Error("У аккаунта нет доступного второго фактора. Добавьте телефон в Firebase Authentication.");
-    const verifier = new RecaptchaVerifier(auth, "mfa-recaptcha", { size: "invisible" });
+    const phoneHint = resolver.hints.find(
+      (hint) => hint.factorId === PhoneMultiFactorGenerator.FACTOR_ID
+    ) as PhoneMultiFactorInfo | undefined;
+
+    if (!phoneHint) {
+      throw new Error(
+        "У аккаунта нет доступного второго фактора. Добавьте номер телефона в Firebase Authentication."
+      );
+    }
+
+    const container = document.getElementById("mfa-recaptcha") || document.body;
+    const verifier = new RecaptchaVerifier(auth, container, { size: "invisible" });
+
     try {
       const verificationId = await new PhoneAuthProvider(auth).verifyPhoneNumber(
         { multiFactorHint: phoneHint, session: resolver.session },
-        verifier,
+        verifier
       );
-      const code = window.prompt(`Введите код из SMS, отправленного на ${phoneHint.phoneNumber || "ваш телефон"}`);
+      const code = window.prompt(
+        `Введите код подтверждения из SMS, отправленного на ${phoneHint.phoneNumber || "ваш телефон"}:`
+      );
       if (!code) return null;
       const credential = PhoneAuthProvider.credential(verificationId, code.trim());
       const assertion = PhoneMultiFactorGenerator.assertion(credential);
       return (await resolver.resolveSignIn(assertion)).user;
     } finally {
-      await verifier.clear();
+      verifier.clear();
     }
   }
 }
 
 export async function enrollPhoneMfa(user: User, verificationId: string, code: string) {
   const credential = PhoneAuthProvider.credential(verificationId, code);
-  await multiFactor(user).enroll(PhoneMultiFactorGenerator.assertion(credential), "CRM security phone");
+  await multiFactor(user).enroll(
+    PhoneMultiFactorGenerator.assertion(credential),
+    "CRM security phone"
+  );
 }
 
-export async function isSecondFactorSession(user: User) {
-  const token = await user.getIdTokenResult(true);
-  const firebaseClaims = token.claims.firebase as { sign_in_second_factor?: string } | undefined;
-  return Boolean(firebaseClaims?.sign_in_second_factor);
+export async function isSecondFactorSession(user: User): Promise<boolean> {
+  try {
+    const token = await user.getIdTokenResult(true);
+    const firebaseClaims = token.claims.firebase as
+      | { sign_in_second_factor?: string }
+      | undefined;
+    return Boolean(firebaseClaims?.sign_in_second_factor);
+  } catch {
+    return false;
+  }
 }
 
 export { multiFactor, signOut, RecaptchaVerifier };
