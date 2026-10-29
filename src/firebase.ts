@@ -28,7 +28,7 @@ import {
   type Database,
 } from "firebase/database";
 
-const RTDB_URL = "https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app";
+export const RTDB_URL = "https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyCbAfAp4_AydyvWZZ7CyzvLKNM_iTltTYM",
@@ -48,28 +48,37 @@ export const functions = getFunctions(app, "europe-west1");
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
-// Realtime Database helpers for F Launcher sync
-export async function rtdbSet(path: string, data: unknown) {
+// Realtime Database helpers with error feedback
+export async function rtdbSet(path: string, data: unknown): Promise<{ success: boolean; error?: string }> {
   try {
     await set(ref(rtdb, path), data);
-  } catch (err) {
-    console.warn(`RTDB set error at ${path}:`, err);
+    return { success: true };
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`RTDB set error at ${path}:`, errorMsg);
+    return { success: false, error: errorMsg };
   }
 }
 
-export async function rtdbUpdate(path: string, data: object) {
+export async function rtdbUpdate(path: string, data: object): Promise<{ success: boolean; error?: string }> {
   try {
     await update(ref(rtdb, path), data);
-  } catch (err) {
-    console.warn(`RTDB update error at ${path}:`, err);
+    return { success: true };
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`RTDB update error at ${path}:`, errorMsg);
+    return { success: false, error: errorMsg };
   }
 }
 
-export async function rtdbRemove(path: string) {
+export async function rtdbRemove(path: string): Promise<{ success: boolean; error?: string }> {
   try {
     await remove(ref(rtdb, path));
-  } catch (err) {
-    console.warn(`RTDB remove error at ${path}:`, err);
+    return { success: true };
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`RTDB remove error at ${path}:`, errorMsg);
+    return { success: false, error: errorMsg };
   }
 }
 
@@ -85,6 +94,56 @@ export async function rtdbGet<T>(path: string): Promise<T | null> {
     return null;
   }
 }
+
+// Test live read/write access to RTDB
+export async function rtdbTestAccess(): Promise<{ canRead: boolean; canWrite: boolean; message: string }> {
+  let canRead = false;
+  let canWrite = false;
+  let message = "";
+
+  try {
+    await get(ref(rtdb, "admin"));
+    canRead = true;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    message = `Чтение: ${msg}`;
+  }
+
+  try {
+    const testPath = `_diagnostics/ping_${Date.now()}`;
+    await set(ref(rtdb, testPath), { time: Date.now(), user: auth.currentUser?.email || "anonymous" });
+    await remove(ref(rtdb, testPath));
+    canWrite = true;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    message = message ? `${message} | Запись: ${msg}` : `Запись: ${msg}`;
+  }
+
+  return { canRead, canWrite, message };
+}
+
+export const RECOMMENDED_RTDB_RULES = `{
+  "rules": {
+    ".read": "auth != null",
+    ".write": "auth != null",
+    "admin": {
+      ".read": true,
+      ".write": "auth != null && auth.token.email === 'a60840397@gmail.com'"
+    },
+    "news": {
+      ".read": true,
+      ".write": "auth != null"
+    },
+    "bans": {
+      ".read": true,
+      ".write": "auth != null"
+    },
+    "config": {
+      ".read": true,
+      ".write": "auth != null"
+    }
+  }
+}`;
 
 export async function call<T>(name: string, data?: Record<string, unknown>): Promise<T> {
   const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
