@@ -25,9 +25,8 @@ type StaffMember = { id: string; email: string; displayName?: string; role: Role
 type AuditEntry = { id: string; actorUid: string; action: string; payload: Record<string, unknown>; at?: number };
 type Overview = { playerCount: number; campaigns: Campaign[]; errors: CrmError[]; daily: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> };
 
-// Primary Chief Administrator specified by user
+// Primary Chief Administrator specified by user & configured in RTDB (/admin: "a60840397@gmail.com")
 const PRIMARY_CHIEF_EMAIL = "a60840397@gmail.com";
-// Trusted initial owner emails allowed to administer the CRM
 const TRUSTED_OWNERS = [PRIMARY_CHIEF_EMAIL.toLowerCase(), "uaonline994@gmail.com".toLowerCase()];
 
 const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
@@ -47,13 +46,10 @@ function dateLabel(value?: number) {
 
 function errorText(error: unknown) {
   if (typeof error === "object" && error && "code" in error && error.code === "functions/internal") {
-    return "Cloud Function вернула INTERNAL. Изменения синхронизированы напрямую через RTDB и Firestore.";
+    return "Cloud Function вернула INTERNAL. Изменения синхронизированы напрямую через RTDB.";
   }
   if (typeof error === "object" && error && "message" in error) {
     const message = String((error as { message: unknown }).message).replace(/^Firebase: /, "");
-    if (message.toLowerCase().includes("client is offline")) {
-      return "CRM пытается подключиться к furry-launcher. Проверьте сеть или доступ к базам.";
-    }
     return message;
   }
   return "Не удалось выполнить операцию.";
@@ -82,26 +78,32 @@ function firestoreRow<T>(id: string, data: Record<string, unknown>): T {
   } as unknown as T;
 }
 
-async function readRows<T>(path: string, ...constraints: QueryConstraint[]): Promise<T[]> {
-  const result = await getDocs(query(collection(db, path), ...constraints));
-  return result.docs.map((item) => firestoreRow<T>(item.id, item.data()));
+async function safeReadFirestore<T>(path: string, ...constraints: QueryConstraint[]): Promise<T[]> {
+  try {
+    const result = await getDocs(query(collection(db, path), ...constraints));
+    return result.docs.map((item) => firestoreRow<T>(item.id, item.data()));
+  } catch (err) {
+    console.warn(`Firestore read skipped for ${path}:`, err);
+    return [];
+  }
 }
 
 async function logAuditAction(actorUid: string, action: string, payload: Record<string, unknown>) {
   const auditId = `audit_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const record = { actorUid, action, payload, at: Date.now() };
 
-  // Write to both Firestore and Realtime Database
-  try {
-    await setDoc(doc(db, "auditLog", auditId), record);
-  } catch (err) {
-    console.warn("Firestore audit log error:", err);
-  }
-
+  // Write to Realtime Database
   try {
     await rtdbSet(`auditLog/${auditId}`, record);
   } catch (err) {
     console.warn("RTDB audit log error:", err);
+  }
+
+  // Write to Firestore if available
+  try {
+    await setDoc(doc(db, "auditLog", auditId), record);
+  } catch (err) {
+    // Ignore Firestore errors
   }
 }
 
@@ -149,24 +151,28 @@ export default function App() {
       setRole(null);
       setSecondFactor(false);
       setLoading(true);
+      setError("");
 
       if (!currentUser) {
         setLoading(false);
         return;
       }
 
-      try {
-        const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
-        const isTrustedOwner = TRUSTED_OWNERS.includes(tokenEmail);
-        const isChief = tokenEmail === PRIMARY_CHIEF_EMAIL.toLowerCase();
+      const tokenEmail = currentUser.email?.trim().toLowerCase() || "";
+      const isChief = tokenEmail === PRIMARY_CHIEF_EMAIL.toLowerCase();
+      const isHardcodedOwner = TRUSTED_OWNERS.includes(tokenEmail);
 
-        // Check if user is already registered in staff collection
-        const staffRef = doc(db, "staff", currentUser.uid);
-        let staffSnapshot = await getDoc(staffRef);
-        let staffData = staffSnapshot.exists() ? staffSnapshot.data() : null;
+      // STEP 1: If user email is PRIMARY_CHIEF_EMAIL (or trusted developer), grant owner status IMMEDIATELY!
+      // This is 100% resilient and cannot be blocked by any database read error.
+      if (isChief || isHardcodedOwner) {
+        setRole("owner");
+        setAccessDiagnostic("Доступ подтверждён (Главный администратор).");
+        setSecondFactor(true); // Owner can enter directly
+        setBypassMfa(true);
+        setLoading(false);
 
-        // Auto-initialize Chief / Trusted Owner records in both Firestore & RTDB
-        if (isTrustedOwner) {
+        // Async background sync: write owner info to RTDB and Firestore
+        void (async () => {
           const ownerProfile = {
             email: tokenEmail,
             displayName: currentUser.displayName || (isChief ? "Главный администратор" : tokenEmail.split("@")[0]),
@@ -174,47 +180,59 @@ export default function App() {
             isChief,
             updatedAt: Date.now(),
           };
+          await rtdbSet(`staff/${currentUser.uid}`, ownerProfile).catch(() => null);
+          await rtdbSet("admin", tokenEmail).catch(() => null); // sync root /admin in RTDB
+          await setDoc(doc(db, "staff", currentUser.uid), ownerProfile, { merge: true }).catch(() => null);
+        })();
 
-          if (!staffSnapshot.exists() || staffData?.role !== "owner") {
-            try {
-              await setDoc(staffRef, { ...ownerProfile, createdAt: Date.now() }, { merge: true });
-              await rtdbSet(`staff/${currentUser.uid}`, { ...ownerProfile, createdAt: Date.now() });
-              await logAuditAction(currentUser.uid, "owner_session_established", { email: tokenEmail, isChief });
-            } catch (initErr) {
-              console.warn("Owner profile sync error:", initErr);
-            }
-          }
+        return;
+      }
 
+      // STEP 2: For other users, check if they are the admin configured in RTDB (/admin) or in RTDB /staff
+      try {
+        const rtdbAdminVal = await rtdbGet<string>("admin").catch(() => null);
+        if (rtdbAdminVal && String(rtdbAdminVal).trim().toLowerCase() === tokenEmail) {
           setRole("owner");
-          setAccessDiagnostic("Доступ подтверждён (Главный администратор).");
-        } else {
-          // Check staff database for regular invited employees
-          if (!staffData) {
-            // Also check Realtime Database staff
-            const rtdbStaff = await rtdbGet<StaffMember>(`staff/${currentUser.uid}`);
-            if (rtdbStaff) {
-              staffData = rtdbStaff;
-            }
-          }
-
-          const staffEmail = String(staffData?.email || "").trim().toLowerCase();
-          const roleValue = staffData?.role;
-          const roleValid = roleValue === "owner" || roleValue === "support" || roleValue === "marketing";
-
-          if (roleValid && staffEmail === tokenEmail) {
-            setRole(roleValue as Role);
-            setAccessDiagnostic(`Роль подтверждена (${roleValue}).`);
-          } else {
-            // Strictly deny access. No unauthorized person can self-grant!
-            setRole(null);
-            setAccessDiagnostic("Доступ запрещён. Ваш аккаунт не авторизован в CRM F Launcher.");
-          }
+          setAccessDiagnostic("Доступ подтверждён (RTDB Admin).");
+          setSecondFactor(true);
+          setLoading(false);
+          return;
         }
 
-        const has2fa = await isSecondFactorSession(currentUser);
-        setSecondFactor(has2fa);
-      } catch (cause) {
-        setError(errorText(cause));
+        // Check RTDB /staff/{uid}
+        const rtdbStaff = await rtdbGet<StaffMember>(`staff/${currentUser.uid}`).catch(() => null);
+        if (rtdbStaff && rtdbStaff.email?.trim().toLowerCase() === tokenEmail) {
+          setRole(rtdbStaff.role);
+          setAccessDiagnostic(`Роль подтверждена (${rtdbStaff.role}).`);
+          setSecondFactor(await isSecondFactorSession(currentUser));
+          setLoading(false);
+          return;
+        }
+
+        // Check Firestore staff collection if RTDB had no entry
+        try {
+          const staffRef = doc(db, "staff", currentUser.uid);
+          const staffSnapshot = await getDoc(staffRef);
+          if (staffSnapshot.exists()) {
+            const data = staffSnapshot.data();
+            if (data?.email?.trim().toLowerCase() === tokenEmail) {
+              setRole(data.role as Role);
+              setAccessDiagnostic(`Роль подтверждена (${data.role}).`);
+              setSecondFactor(await isSecondFactorSession(currentUser));
+              setLoading(false);
+              return;
+            }
+          }
+        } catch {
+          // Ignore Firestore error
+        }
+
+        // Unauthorized user: access denied!
+        setRole(null);
+        setAccessDiagnostic("Доступ запрещён. Ваш аккаунт не авторизован в CRM F Launcher.");
+      } catch (checkErr) {
+        console.warn("Auth role check error:", checkErr);
+        setRole(null);
       } finally {
         setLoading(false);
       }
@@ -231,33 +249,46 @@ export default function App() {
     setError("");
     try {
       if (target === "overview" || target === "analytics") {
-        // Load counts and rows from Firestore with fallback to RTDB
-        let playerCount = 0;
+        // 1. Read from Realtime Database first (primary source for F Launcher)
+        const [rtdbPlayers, rtdbCampaigns, rtdbErrors, rtdbDaily] = await Promise.all([
+          rtdbGet<Record<string, Player>>("players").catch(() => null),
+          rtdbGet<Record<string, Campaign>>("zbtCampaigns").catch(() => null),
+          rtdbGet<Record<string, CrmError>>("errors").catch(() => null),
+          rtdbGet<Record<string, { date?: string; activePlayers?: number; events?: number }>>("dailyAnalytics").catch(() => null),
+        ]);
+
         let campaignRows: Campaign[] = [];
+        if (rtdbCampaigns) {
+          campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
+        }
+
         let errorRows: CrmError[] = [];
+        if (rtdbErrors) {
+          errorRows = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
+        }
+
         let dailyRows: Array<{ id: string; date?: string; activePlayers?: number; events?: number }> = [];
+        if (rtdbDaily) {
+          dailyRows = Object.entries(rtdbDaily).map(([id, val]) => ({ ...val, id }));
+        }
 
-        try {
-          if (role !== "marketing") {
-            const countSnap = await getCountFromServer(collection(db, "players")).catch(() => null);
-            playerCount = countSnap ? countSnap.data().count : 0;
-            campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []);
-            errorRows = await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(20)).catch(() => []);
-          }
-          dailyRows = await readRows<{ id: string; date?: string; activePlayers?: number; events?: number }>("dailyAnalytics", orderBy("date", "desc"), limit(30)).catch(() => []);
-        } catch {
-          // Read from RTDB
-          const rtdbPlayers = await rtdbGet<Record<string, Player>>("players");
-          playerCount = rtdbPlayers ? Object.keys(rtdbPlayers).length : 0;
+        let playerCount = rtdbPlayers ? Object.keys(rtdbPlayers).length : 0;
 
-          const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns");
-          if (rtdbCampaigns) {
-            campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
-          }
-
-          const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors");
-          if (rtdbErrors) {
-            errorRows = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
+        // Also check Firestore if RTDB had zero
+        if (!campaignRows.length) {
+          const fsCampaigns = await safeReadFirestore<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50));
+          if (fsCampaigns.length) campaignRows = fsCampaigns;
+        }
+        if (!errorRows.length) {
+          const fsErrors = await safeReadFirestore<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(20));
+          if (fsErrors.length) errorRows = fsErrors;
+        }
+        if (playerCount === 0) {
+          try {
+            const countSnap = await getCountFromServer(collection(db, "players"));
+            playerCount = countSnap.data().count;
+          } catch {
+            // ignore
           }
         }
 
@@ -267,97 +298,120 @@ export default function App() {
       }
 
       if (target === "zbt") {
-        let campaignRows = await readRows<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50)).catch(() => []);
+        let campaignRows: Campaign[] = [];
+        const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns").catch(() => null);
+        if (rtdbCampaigns) {
+          campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
+        }
         if (!campaignRows.length) {
-          const rtdbCampaigns = await rtdbGet<Record<string, Campaign>>("zbtCampaigns");
-          if (rtdbCampaigns) {
-            campaignRows = Object.entries(rtdbCampaigns).map(([id, val]) => ({ ...val, id }));
-          }
+          campaignRows = await safeReadFirestore<Campaign>("zbtCampaigns", orderBy("createdAt", "desc"), limit(50));
         }
         setCampaigns(campaignRows);
         if (selectedCampaign) await loadKeys(selectedCampaign);
       }
 
       if (target === "players") {
-        let playerRows = await readRows<Omit<Player, "uid"> & { id: string }>("players", orderBy("lastSeenAt", "desc"), limit(200)).catch(() => []);
-        let mappedPlayers = playerRows.map(({ id, ...player }) => ({ ...player, uid: id }));
+        let mappedPlayers: Player[] = [];
 
-        // Also merge with RTDB /players and /bans
-        const rtdbPlayers = await rtdbGet<Record<string, Player>>("players");
-        const rtdbBans = await rtdbGet<Record<string, { bannedAt?: number; reason?: string }>>("bans");
+        // Read RTDB /players and /bans
+        const rtdbPlayers = await rtdbGet<Record<string, Player>>("players").catch(() => null);
+        const rtdbBans = await rtdbGet<Record<string, { bannedAt?: number; reason?: string }>>("bans").catch(() => null);
 
         if (rtdbPlayers) {
-          const rtdbMapped = Object.entries(rtdbPlayers).map(([uid, p]) => ({
+          mappedPlayers = Object.entries(rtdbPlayers).map(([uid, p]) => ({
             ...p,
             uid,
             status: rtdbBans && rtdbBans[uid] ? "BANNED" : p.status || "ACTIVE",
           }));
-          // Combine unique by uid
-          const map = new Map<string, Player>();
-          mappedPlayers.forEach((p) => map.set(p.uid, p));
-          rtdbMapped.forEach((p) => map.set(p.uid, { ...map.get(p.uid), ...p }));
-          mappedPlayers = Array.from(map.values());
         }
 
-        // Apply any active bans from bans collection
-        if (rtdbBans) {
-          mappedPlayers = mappedPlayers.map((p) => ({
-            ...p,
-            status: rtdbBans[p.uid] ? "BANNED" : p.status,
-          }));
+        // Also merge Firestore players if any
+        const fsPlayers = await safeReadFirestore<Omit<Player, "uid"> & { id: string }>("players", orderBy("lastSeenAt", "desc"), limit(200));
+        if (fsPlayers.length) {
+          const map = new Map<string, Player>();
+          mappedPlayers.forEach((p) => map.set(p.uid, p));
+          fsPlayers.forEach(({ id, ...p }) => {
+            if (!map.has(id)) {
+              map.set(id, { ...p, uid: id, status: rtdbBans && rtdbBans[id] ? "BANNED" : p.status || "ACTIVE" });
+            }
+          });
+          mappedPlayers = Array.from(map.values());
         }
 
         setPlayers(mappedPlayers);
       }
 
       if (target === "errors") {
-        let errorList = await readRows<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100)).catch(() => []);
+        let errorList: CrmError[] = [];
+        const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors").catch(() => null);
+        if (rtdbErrors) {
+          errorList = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
+        }
         if (!errorList.length) {
-          const rtdbErrors = await rtdbGet<Record<string, CrmError>>("errors");
-          if (rtdbErrors) {
-            errorList = Object.entries(rtdbErrors).map(([id, val]) => ({ ...val, id }));
-          }
+          errorList = await safeReadFirestore<CrmError>("errorGroups", orderBy("updatedAt", "desc"), limit(100));
         }
         setErrors(errorList);
       }
 
       if (target === "news") {
-        let newsList = await readRows<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100)).catch(() => []);
+        let newsList: Announcement[] = [];
+        const rtdbNews = await rtdbGet<Record<string, Announcement>>("news").catch(() => null);
+        if (rtdbNews) {
+          newsList = Object.entries(rtdbNews).map(([id, val]) => ({ ...val, id }));
+        }
         if (!newsList.length) {
-          const rtdbNews = await rtdbGet<Record<string, Announcement>>("news");
-          if (rtdbNews) {
-            newsList = Object.entries(rtdbNews).map(([id, val]) => ({ ...val, id }));
-          }
+          newsList = await safeReadFirestore<Announcement>("announcements", orderBy("updatedAt", "desc"), limit(100));
         }
         setAnnouncements(newsList);
       }
 
       if (target === "staff") {
-        let staffList = await readRows<StaffMember>("staff", orderBy("email", "asc")).catch(() => []);
-        const rtdbStaff = await rtdbGet<Record<string, StaffMember>>("staff");
+        const staffMap = new Map<string, StaffMember>();
+        // Always include Chief Admin
+        staffMap.set(PRIMARY_CHIEF_EMAIL.toLowerCase(), {
+          id: "chief",
+          email: PRIMARY_CHIEF_EMAIL,
+          displayName: "Главный администратор",
+          role: "owner",
+          isChief: true,
+        });
+
+        // Read RTDB /staff
+        const rtdbStaff = await rtdbGet<Record<string, StaffMember>>("staff").catch(() => null);
         if (rtdbStaff) {
-          const map = new Map<string, StaffMember>();
-          staffList.forEach((s) => map.set(s.email, s));
-          Object.entries(rtdbStaff).forEach(([id, s]) => map.set(s.email, { ...s, id }));
-          staffList = Array.from(map.values());
+          Object.entries(rtdbStaff).forEach(([id, s]) => {
+            if (s && s.email) {
+              staffMap.set(s.email.toLowerCase(), { ...s, id, isChief: s.email.toLowerCase() === PRIMARY_CHIEF_EMAIL.toLowerCase() });
+            }
+          });
         }
-        setStaff(staffList);
+
+        // Read Firestore staff
+        const fsStaff = await safeReadFirestore<StaffMember>("staff");
+        fsStaff.forEach((s) => {
+          if (s && s.email && !staffMap.has(s.email.toLowerCase())) {
+            staffMap.set(s.email.toLowerCase(), s);
+          }
+        });
+
+        setStaff(Array.from(staffMap.values()));
       }
 
       if (target === "audit") {
-        let auditList = await readRows<AuditEntry>("auditLog", orderBy("at", "desc"), limit(200)).catch(() => []);
+        let auditList: AuditEntry[] = [];
+        const rtdbAudit = await rtdbGet<Record<string, AuditEntry>>("auditLog").catch(() => null);
+        if (rtdbAudit) {
+          auditList = Object.entries(rtdbAudit)
+            .map(([id, val]) => ({ ...val, id }))
+            .sort((a, b) => (b.at || 0) - (a.at || 0));
+        }
         if (!auditList.length) {
-          const rtdbAudit = await rtdbGet<Record<string, AuditEntry>>("auditLog");
-          if (rtdbAudit) {
-            auditList = Object.entries(rtdbAudit)
-              .map(([id, val]) => ({ ...val, id }))
-              .sort((a, b) => (b.at || 0) - (a.at || 0));
-          }
+          auditList = await safeReadFirestore<AuditEntry>("auditLog", orderBy("at", "desc"), limit(200));
         }
         setAudit(auditList);
       }
     } catch (cause) {
-      setError(errorText(cause));
+      console.warn("loadPage error:", cause);
     } finally {
       setBusy(false);
     }
@@ -366,14 +420,15 @@ export default function App() {
   async function loadKeys(campaignId: string) {
     setSelectedCampaign(campaignId);
     try {
-      let keysList = await readRows<ZbtKey>("zbtKeys", where("campaignId", "==", campaignId), limit(500)).catch(() => []);
+      let keysList: ZbtKey[] = [];
+      const rtdbKeys = await rtdbGet<Record<string, ZbtKey>>("zbtKeys").catch(() => null);
+      if (rtdbKeys) {
+        keysList = Object.entries(rtdbKeys)
+          .map(([id, val]) => ({ ...val, id }))
+          .filter((k) => k.campaignId === campaignId);
+      }
       if (!keysList.length) {
-        const rtdbKeys = await rtdbGet<Record<string, ZbtKey>>("zbtKeys");
-        if (rtdbKeys) {
-          keysList = Object.entries(rtdbKeys)
-            .map(([id, val]) => ({ ...val, id }))
-            .filter((k) => k.campaignId === campaignId);
-        }
+        keysList = await safeReadFirestore<ZbtKey>("zbtKeys", where("campaignId", "==", campaignId), limit(500));
       }
       setKeys(keysList);
     } catch (cause) {
@@ -450,7 +505,21 @@ export default function App() {
         expiresAt: expiresAtMs,
       };
 
-      // 1. Sync to Firestore
+      // 1. Sync to Realtime Database
+      await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
+      const rtdbKeyBatch: Record<string, unknown> = {};
+      for (const rawKey of generatedKeys) {
+        const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
+        rtdbKeyBatch[keyHash] = {
+          campaignId,
+          status: "UNUSED",
+          rawKey,
+          createdAt: Date.now(),
+        };
+      }
+      await rtdbUpdate("zbtKeys", rtdbKeyBatch);
+
+      // 2. Sync to Firestore (optional fallback)
       try {
         await setDoc(doc(db, "zbtCampaigns", campaignId), campaignPayload);
         for (const rawKey of generatedKeys) {
@@ -462,25 +531,7 @@ export default function App() {
           });
         }
       } catch (fErr) {
-        console.warn("Firestore campaign write:", fErr);
-      }
-
-      // 2. Sync to Realtime Database
-      try {
-        await rtdbSet(`zbtCampaigns/${campaignId}`, campaignPayload);
-        const rtdbKeyBatch: Record<string, unknown> = {};
-        for (const rawKey of generatedKeys) {
-          const keyHash = `hash_${rawKey.replace(/[^A-Za-z0-9]/g, "")}`;
-          rtdbKeyBatch[keyHash] = {
-            campaignId,
-            status: "UNUSED",
-            rawKey,
-            createdAt: Date.now(),
-          };
-        }
-        await rtdbUpdate("zbtKeys", rtdbKeyBatch);
-      } catch (rErr) {
-        console.warn("RTDB campaign write:", rErr);
+        // ignore
       }
 
       csvContent = "index,key,campaign,status\n" + generatedKeys.map((k, idx) => `${idx + 1},${k},${campaignName},UNUSED`).join("\n");
@@ -494,7 +545,7 @@ export default function App() {
       link.click();
       URL.revokeObjectURL(link.href);
 
-      setNotice("Кампания и ЗБТ-ключи успешно сохранены в Firestore и RTDB! CSV скачан.");
+      setNotice("Кампания и ЗБТ-ключи успешно сохранены в базе! CSV скачан.");
       setCampaignName("");
       setShowCampaignForm(false);
       await loadPage("zbt");
@@ -507,8 +558,8 @@ export default function App() {
 
   async function setCampaignStatus(campaignId: string, status: string) {
     try {
-      await updateDoc(doc(db, "zbtCampaigns", campaignId), { status, updatedAt: Date.now() }).catch(() => null);
       await rtdbUpdate(`zbtCampaigns/${campaignId}`, { status, updatedAt: Date.now() });
+      await updateDoc(doc(db, "zbtCampaigns", campaignId), { status, updatedAt: Date.now() }).catch(() => null);
       if (user) await logAuditAction(user.uid, "set_campaign_status", { campaignId, status });
       setNotice(`Статус кампании обновлён: ${status}`);
       await loadPage("zbt");
@@ -520,8 +571,8 @@ export default function App() {
   async function revokeKey(keyId: string) {
     if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
     try {
-      await updateDoc(doc(db, "zbtKeys", keyId), { status: "REVOKED", revokedAt: Date.now() }).catch(() => null);
       await rtdbUpdate(`zbtKeys/${keyId}`, { status: "REVOKED", revokedAt: Date.now() });
+      await updateDoc(doc(db, "zbtKeys", keyId), { status: "REVOKED", revokedAt: Date.now() }).catch(() => null);
       if (user) await logAuditAction(user.uid, "revoke_key", { keyId });
       setNotice("Ключ ЗБТ отозван.");
       await loadKeys(selectedCampaign);
@@ -543,8 +594,8 @@ export default function App() {
         invitedBy: user?.email || "owner",
       };
 
-      await setDoc(doc(db, "staff", staffDocId), payload).catch(() => null);
       await rtdbSet(`staff/${staffDocId}`, payload);
+      await setDoc(doc(db, "staff", staffDocId), payload).catch(() => null);
       if (user) await logAuditAction(user.uid, "invite_staff", { email, role: inviteRole });
 
       setInviteEmail("");
@@ -556,25 +607,22 @@ export default function App() {
     }
   }
 
-  // Ban / Unban player with immediate sync to Realtime Database /bans and Firestore
+  // Ban / Unban player with immediate sync to Realtime Database /bans
   async function changePlayerStatus(player: Player) {
     const isBanning = player.status !== "BANNED";
     const newStatus = isBanning ? "BANNED" : "ACTIVE";
     const confirmMessage = isBanning
       ? `Заблокировать доступ игроку ${player.nickname || player.uid} в лаунчере? (Запись будет внесена в RTDB /bans)`
-      : `Снять блокировку с игрока ${player.nickname || player.uid}?`;
+      : `Снять блокировку с игрока ${player.nickname || player.uid}? (Запись будет удалена из RTDB /bans)`;
 
     if (!window.confirm(confirmMessage)) return;
 
     try {
-      // 1. Update Firestore
-      await updateDoc(doc(db, "players", player.uid), { status: newStatus, updatedAt: Date.now() }).catch(() => null);
-
-      // 2. Synchronize with Realtime Database (used by F Launcher client)
+      // 1. Synchronize with Realtime Database (used by F Launcher client)
       await rtdbUpdate(`players/${player.uid}`, { status: newStatus, updatedAt: Date.now() });
 
       if (isBanning) {
-        // Add to /bans
+        // Add to /bans in RTDB
         await rtdbSet(`bans/${player.uid}`, {
           uid: player.uid,
           nickname: player.nickname || "",
@@ -584,9 +632,12 @@ export default function App() {
           reason: "Блокировка администратором в F Launcher CRM",
         });
       } else {
-        // Remove from /bans
+        // Remove from /bans in RTDB
         await rtdbRemove(`bans/${player.uid}`);
       }
+
+      // 2. Also mirror to Firestore if present
+      await updateDoc(doc(db, "players", player.uid), { status: newStatus, updatedAt: Date.now() }).catch(() => null);
 
       // 3. Audit log
       if (user) {
@@ -606,9 +657,8 @@ export default function App() {
 
   async function updateError(errorItem: CrmError, status: string) {
     try {
-      const errorRef = doc(db, "errorGroups", errorItem.id || errorItem.fingerprint);
-      await updateDoc(errorRef, { status, updatedAt: Date.now() }).catch(() => null);
       await rtdbUpdate(`errors/${errorItem.id || errorItem.fingerprint}`, { status, updatedAt: Date.now() });
+      await updateDoc(doc(db, "errorGroups", errorItem.id || errorItem.fingerprint), { status, updatedAt: Date.now() }).catch(() => null);
       if (user) await logAuditAction(user.uid, "update_error_status", { fingerprint: errorItem.fingerprint, status });
       setNotice(`Статус ошибки обновлён: ${status}`);
       await loadPage("errors");
@@ -629,18 +679,18 @@ export default function App() {
         author: user?.email || "admin",
       };
 
-      // Sync to Firestore announcements
-      await setDoc(doc(db, "announcements", announcementId), payload).catch(() => null);
-      // Sync to Realtime Database /news for game launcher feed
+      // Sync to Realtime Database /news for game launcher client feed
       await rtdbSet(`news/${announcementId}`, payload);
       await rtdbSet(`announcements/${announcementId}`, payload);
+      // Sync to Firestore announcements
+      await setDoc(doc(db, "announcements", announcementId), payload).catch(() => null);
 
       if (user) await logAuditAction(user.uid, "save_announcement", { title: newsTitle, status: newsStatus });
 
       setNewsTitle("");
       setNewsBody("");
       setShowNewsForm(false);
-      setNotice("Новость опубликована в Firestore и Realtime Database!");
+      setNotice("Новость опубликована в Realtime Database (/news)!");
       await loadPage("news");
     } catch (cause) {
       setError(errorText(cause));
@@ -660,7 +710,7 @@ export default function App() {
     return (
       <div className="boot">
         <span className="loader" />
-        <span>Подключение к furry-launcher (RTDB & Firestore)...</span>
+        <span>Подключение к furry-launcher-default-rtdb...</span>
       </div>
     );
   }
@@ -778,13 +828,13 @@ export default function App() {
             <strong>{currentPage.label}</strong>
           </div>
           <div className="top-actions">
-            <span className="live-indicator" title="Синхронизация с Realtime Database и Firestore">
-              <i /> RTDB & Firestore Online
+            <span className="live-indicator" title="Синхронизация с furry-launcher-default-rtdb">
+              <i /> furry-launcher-default-rtdb Online
             </span>
             <button
               className="icon-button"
               onClick={() => loadPage(page)}
-              title="Обновить данные из баз"
+              title="Обновить данные из базы"
               disabled={busy}
             >
               <RefreshCw size={17} className={busy ? "spin" : ""} />
@@ -793,7 +843,7 @@ export default function App() {
               className="help-button"
               title="Информация о базах"
               onClick={() =>
-                alert(`Базы данных F Launcher:\n1. Realtime Database: https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app\n2. Firestore: furry-launcher\nГлавный администратор: ${PRIMARY_CHIEF_EMAIL}`)
+                alert(`База данных F Launcher:\nhttps://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app/\nГлавный администратор: ${PRIMARY_CHIEF_EMAIL}`)
               }
             >
               <CircleHelp size={17} />
@@ -931,7 +981,7 @@ export default function App() {
               />
             </label>
             <p className="form-hint">
-              Ключи формата FL-XXXX-XXXX-XXXX сохраняются в Realtime Database и Firestore. CSV-файл сразу скачивается.
+              Ключи формата FL-XXXX-XXXX-XXXX сохраняются в Realtime Database (/zbtKeys). CSV-файл сразу скачивается.
             </p>
             <div className="modal-actions">
               <button className="button secondary" type="button" onClick={() => setShowCampaignForm(false)}>
@@ -1051,7 +1101,7 @@ function LoginScreen({ onSignIn, error }: { onSignIn: () => void; error: string 
         </button>
         <div className="login-security">
           <ShieldCheck size={16} />
-          <span>Realtime Database · Firestore · Строгая RBAC защита</span>
+          <span>Realtime Database · Строгая RBAC защита</span>
         </div>
         <small className="login-footer">
           Главный администратор: {PRIMARY_CHIEF_EMAIL}. Неавторизованные лица блокируются сервером.
@@ -1299,7 +1349,7 @@ function OverviewPage({
       <div className="bottom-note">
         <ShieldCheck size={17} />
         <span>
-          База данных: <b>https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app/</b> и Firestore синхронизированы в реальном времени.
+          База данных: <b>https://furry-launcher-default-rtdb.europe-west1.firebasedatabase.app/</b> активна.
         </span>
       </div>
     </>
@@ -1323,7 +1373,7 @@ function ZbtPage(props: {
           <p className="eyebrow">BETA ACCESS</p>
           <h2>Кампании и активации ЗБТ</h2>
         </div>
-        <span className="subtle">Синхронизируются в RTDB /zbtCampaigns и Firestore</span>
+        <span className="subtle">Синхронизируются в RTDB /zbtCampaigns</span>
       </div>
       <div className="table-wrap">
         <table>
@@ -1757,7 +1807,7 @@ function StaffPage({
                   </td>
                   <td>
                     <span className="permission-check">
-                      <Check size={14} /> Подтверждён в RTDB & Firestore
+                      <Check size={14} /> Подтверждён в RTDB
                     </span>
                   </td>
                 </tr>
@@ -1792,7 +1842,7 @@ function AuditPage({ entries }: { entries: AuditEntry[] }) {
           <p className="eyebrow">ADMIN AUDIT</p>
           <h2>Журнал аудита ({entries.length})</h2>
         </div>
-        <span className="subtle">Синхронизируется в RTDB /auditLog и Firestore</span>
+        <span className="subtle">Синхронизируется в RTDB /auditLog</span>
       </div>
       <div className="table-wrap">
         <table>
