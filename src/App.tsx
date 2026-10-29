@@ -44,7 +44,13 @@ function errorText(error: unknown) {
   if (typeof error === "object" && error && "code" in error && error.code === "functions/internal") {
     return "Cloud Function вернула INTERNAL. В Firebase Console откройте логи функции, вызванной этой операцией.";
   }
-  if (typeof error === "object" && error && "message" in error) return String(error.message).replace(/^Firebase: /, "");
+  if (typeof error === "object" && error && "message" in error) {
+    const message = String(error.message).replace(/^Firebase: /, "");
+    if (message.toLowerCase().includes("client is offline")) {
+      return "CRM не может подключиться к Firestore. В Netlify проверьте VITE_FIREBASE_PROJECT_ID=furry-launcher; в Firebase Console убедитесь, что Firestore создан в проекте furry-launcher. Также проверьте соединение и блокировщики запросов к firestore.googleapis.com.";
+    }
+    return message;
+  }
   return "Не удалось выполнить операцию.";
 }
 
