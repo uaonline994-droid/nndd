@@ -37,6 +37,9 @@ function dateLabel(value?: number) {
 }
 
 function errorText(error: unknown) {
+  if (typeof error === "object" && error && "code" in error && error.code === "functions/internal") {
+    return "Cloud Function whoAmI вернула INTERNAL. В Firebase Console откройте Functions → whoAmI → Logs и проверьте запись CRM whoAmI lookup failed.";
+  }
   if (typeof error === "object" && error && "message" in error) return String(error.message).replace(/^Firebase: /, "");
   return "Не удалось выполнить операцию.";
 }
