@@ -14,6 +14,7 @@ import {
   type User,
 } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getFunctions, httpsCallable } from "firebase/functions";
 import {
   getDatabase,
   ref,
@@ -42,6 +43,7 @@ const firebaseConfig = {
 export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const functions = getFunctions(app, "europe-west1");
 export const rtdb: Database = getDatabase(app, RTDB_URL);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
@@ -87,6 +89,11 @@ export async function rtdbGet<T>(path: string): Promise<T | null> {
 
 export function rtdbSubscribe<T>(path: string, onData: (value: T | null) => void, onError?: (error: Error) => void) {
   return onValue(ref(rtdb, path), (snapshot) => onData(snapshot.exists() ? snapshot.val() as T : null), onError);
+}
+
+export async function callFunction<T>(name: string, data: Record<string, unknown> = {}): Promise<T> {
+  const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
+  return (await callable(data)).data;
 }
 
 // Test live read/write access to RTDB

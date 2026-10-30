@@ -3,17 +3,19 @@ import {
   Activity, AlertTriangle, Ban, Check, ChevronDown, CircleHelp,
   Clock3, FileText, KeyRound, LayoutDashboard, LogOut, Mail, Menu, Plus, RefreshCw,
   Search, ShieldCheck, ShieldAlert, Users, X, Download, Database, Copy, CheckCheck,
-  Server, Lock, Sparkles, Filter, ExternalLink, UploadCloud
+  Server, Lock, Sparkles, ExternalLink
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
+import { ShopManager, type ShopItem, type ShopTag } from "./ShopManager";
+import { SalesDashboard, type ShopOrder } from "./SalesDashboard";
 import {
-  auth, beginGoogleSignIn, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
+  auth, beginGoogleSignIn, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
   rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
-  enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
+  enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut, callFunction,
 } from "./firebase";
 
 type Role = "owner" | "support" | "marketing";
-type Page = "overview" | "zbt" | "players" | "errors" | "news" | "staff" | "analytics" | "audit";
+type Page = "overview" | "zbt" | "players" | "errors" | "news" | "staff" | "analytics" | "audit" | "shop" | "sales";
 type Campaign = { id: string; name: string; seats: number; status: string; activatedCount: number; createdAt?: number; expiresAt?: number | null };
 type Player = { uid: string; nickname: string; contactEmail: string; status: string; zbtCampaignId?: string; lastSeenAt?: number };
 type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; usedBy?: string; nickname?: string; installId?: string; activatedAt?: number; usedAt?: number; used?: boolean; rawKey?: string; createdAt?: number; storagePath?: "keys" | "zbtKeys" };
@@ -30,6 +32,8 @@ const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "errors", label: "Ошибки", icon: AlertTriangle },
   { id: "news", label: "Новости", icon: FileText },
   { id: "analytics", label: "Аналитика", icon: Activity },
+  { id: "shop", label: "Магазин", icon: Database },
+  { id: "sales", label: "Продажи", icon: Activity },
   { id: "staff", label: "Сотрудники", icon: ShieldCheck },
   { id: "audit", label: "Журнал аудита", icon: Clock3 },
 ];
@@ -91,6 +95,9 @@ export default function App() {
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [keys, setKeys] = useState<ZbtKey[]>([]);
+  const [shopItems, setShopItems] = useState<ShopItem[]>([]);
+  const [shopTags, setShopTags] = useState<ShopTag[]>([]);
+  const [shopOrders, setShopOrders] = useState<ShopOrder[]>([]);
 
   const [selectedCampaign, setSelectedCampaign] = useState("");
   const [queryText, setQueryText] = useState("");
@@ -216,6 +223,27 @@ export default function App() {
   }, [user, secondFactor, role]);
 
   useEffect(() => {
+    if (!user || !secondFactor || role !== "owner" || !["shop", "sales"].includes(page)) return;
+    return rtdbSubscribe<Record<string, Omit<ShopItem, "id">>>("shop_items", (records) => {
+      setShopItems(recordRows(records) as ShopItem[]);
+    }, (cause) => setError(errorText(cause)));
+  }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
+    if (!user || !secondFactor || role !== "owner" || page !== "sales") return;
+    return rtdbSubscribe<Record<string, Omit<ShopOrder, "id">>>("orders", (records) => {
+      setShopOrders(recordRows(records).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)) as ShopOrder[]);
+    }, (cause) => setError(errorText(cause)));
+  }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
+    if (!user || !secondFactor || role !== "owner" || page !== "shop") return;
+    return rtdbSubscribe<Record<string, Omit<ShopTag, "tag">>>("tags", (records) => {
+      setShopTags(Object.entries(records || {}).map(([tag, value]) => ({ tag, ...value })));
+    }, (cause) => setError(errorText(cause)));
+  }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
     if (!user || !secondFactor || !role || page !== "zbt" || !selectedCampaign) return;
     const recordsByPath: Record<string, Record<string, ZbtKey>> = {};
     const applyKeys = () => {
@@ -327,6 +355,17 @@ export default function App() {
         if (rtdbAudit) {
           setAudit(recordRows<AuditEntry>(rtdbAudit).sort((a, b) => (b.at || 0) - (a.at || 0)));
         }
+      }
+
+      if (target === "shop") {
+        const result = await callFunction<{ items: Record<string, Omit<ShopItem, "id">>; tags: Record<string, Omit<ShopTag, "tag">> }>("listShopItems");
+        setShopItems(recordRows(result.items) as ShopItem[]);
+        setShopTags(Object.entries(result.tags || {}).map(([tag, value]) => ({ tag, ...value })));
+      }
+
+      if (target === "sales") {
+        const result = await callFunction<{ orders: Record<string, Omit<ShopOrder, "id">> }>("listShopOrders");
+        setShopOrders(recordRows(result.orders) as ShopOrder[]);
       }
     } catch (err) {
       console.warn("loadPage error:", err);
@@ -610,6 +649,32 @@ export default function App() {
     await rtdbUpdate(`errors/${errorItem.id || errorItem.fingerprint}`, { status, updatedAt: Date.now() });
   }
 
+  async function saveShopItem(item: Omit<ShopItem, "id">, itemId?: string) {
+    try {
+      await callFunction<{ itemId: string }>("saveShopItem", { itemId: itemId || null, item });
+      setNotice(itemId ? "Товар оновлено." : "Товар додано до каталогу.");
+    } catch (cause) {
+      setError(errorText(cause));
+      throw cause;
+    }
+  }
+
+  async function reviewShopOrder(orderId: string, action: "complete" | "reject" | "revoke") {
+    const prompts = {
+      complete: "Підтверджуйте лише після перевірки фактичного надходження коштів. Активувати покупку?",
+      reject: "Відхилити це замовлення?",
+      revoke: "Відкликати покупку? Це прибере entitlement у гравця, але не поверне кошти автоматично.",
+    };
+    if (!window.confirm(prompts[action])) return;
+    try {
+      await callFunction("reviewShopOrder", { orderId, action });
+      setNotice(action === "revoke" ? "Покупку відкликано; повернення коштів не виконувалося." : "Статус замовлення оновлено.");
+      await loadPage("sales");
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  }
+
   // Execute RTDB diagnostics
   async function runRtdbDiagnostics() {
     setRtdbDiag((prev) => ({ ...prev, testing: true }));
@@ -712,6 +777,7 @@ export default function App() {
   const currentPage = nav.find((item) => item.id === page) || nav[0];
   const visibleNav = nav.filter((item) => {
     if (item.id === "staff" || item.id === "audit") return role === "owner";
+    if (item.id === "shop" || item.id === "sales") return role === "owner";
     if (role === "marketing") return !["zbt", "players", "errors"].includes(item.id);
     return true;
   });
@@ -916,6 +982,8 @@ export default function App() {
             />
           )}
           {page === "analytics" && <AnalyticsPage overview={overview} />}
+          {page === "shop" && <ShopManager items={shopItems} tags={shopTags} onSave={saveShopItem} />}
+          {page === "sales" && <SalesDashboard orders={shopOrders} items={shopItems} onReview={reviewShopOrder} />}
           {page === "staff" && (
             <StaffPage
               staff={staff}
