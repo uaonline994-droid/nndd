@@ -13,7 +13,6 @@ import {
   type PhoneMultiFactorInfo,
   type User,
 } from "firebase/auth";
-import { getFunctions, httpsCallable } from "firebase/functions";
 import { getFirestore } from "firebase/firestore";
 import {
   getDatabase,
@@ -44,7 +43,6 @@ export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfi
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const rtdb: Database = getDatabase(app, RTDB_URL);
-export const functions = getFunctions(app, "europe-west1");
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
@@ -62,7 +60,7 @@ export async function rtdbSet(path: string, data: unknown): Promise<{ success: b
 
 export async function rtdbUpdate(path: string, data: object): Promise<{ success: boolean; error?: string }> {
   try {
-    await update(ref(rtdb, path), data);
+    await update(path ? ref(rtdb, path) : ref(rtdb), data);
     return { success: true };
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -133,8 +131,14 @@ export const RECOMMENDED_RTDB_RULES = `{
     },
     "players": {
       "$uid": {
-        ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
-        ".write": false
+        ".read": "auth != null && (auth.uid === $uid || (auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support'))) ",
+        ".write": "auth != null && auth.uid === $uid",
+        "profile": {
+          ".read": "auth != null && auth.uid === $uid",
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.hasChildren(['nickname', 'lastSeenAt'])",
+          "$other": { ".validate": false }
+        }
       }
     },
     "presence": {
@@ -145,11 +149,58 @@ export const RECOMMENDED_RTDB_RULES = `{
     },
     "zbtCampaigns": {
       ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
-      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'",
+      "$campaignId": {
+        ".read": "auth != null"
+      }
     },
     "zbtKeys": {
       ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
       ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
+    "playerEvents": {
+      "$uid": {
+        ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+        "$eventId": {
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.hasChildren(['eventType', 'area', 'occurredAt', 'locale', 'launcherVersion'])",
+          "$other": { ".validate": false }
+        }
+      }
+    },
+    "errorReports": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      "$uid": {
+        "$errorId": {
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.hasChildren(['occurredAt', 'area', 'title', 'description', 'fingerprint', 'locale', 'launcherVersion', 'device'])",
+          "occurredAt": { ".validate": "newData.isNumber()" },
+          "area": { ".validate": "newData.isString() && newData.val().length <= 48" },
+          "title": { ".validate": "newData.isString() && newData.val().length <= 160" },
+          "description": { ".validate": "newData.isString() && newData.val().length <= 4000" },
+          "fingerprint": { ".validate": "newData.isString() && newData.val().length === 64" },
+          "locale": { ".validate": "newData.isString() && newData.val().length <= 10" },
+          "launcherVersion": { ".validate": "newData.isString() && newData.val().length <= 32" },
+          "gameVersion": { ".validate": "newData.isString() && newData.val().length <= 32" },
+          "stack": { ".validate": "newData.isString() && newData.val().length <= 12000" },
+          "device": {
+            ".validate": "newData.hasChildren(['os', 'architecture', 'ramBucket', 'logicalProcessors'])",
+            "os": { ".validate": "newData.isString() && newData.val().length <= 128" },
+            "architecture": { ".validate": "newData.isString() && newData.val().length <= 24" },
+            "ramBucket": { ".validate": "newData.isString() && newData.val().length <= 16" },
+            "logicalProcessors": { ".validate": "newData.isNumber() && newData.val() <= 256" },
+            "$other": { ".validate": false }
+          },
+          "$other": { ".validate": false }
+        }
+      }
+    },
+    "keys": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
+      "$keyHash": {
+        ".read": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')) || data.child('used').val() === false || data.child('usedBy').val() === auth.uid)",
+        ".write": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner') || (data.exists() && data.child('used').val() === false && data.child('status').val() === 'UNUSED' && data.child('revoked').val() !== true && newData.child('used').val() === true && newData.child('status').val() === 'ACTIVATED' && newData.child('revoked').val() !== true && newData.child('usedBy').val() === auth.uid && newData.child('installId').isString() && newData.child('campaignId').val() === data.child('campaignId').val() && root.child('zbtCampaigns').child(data.child('campaignId').val()).child('status').val() === 'ACTIVE' && newData.child('hash').val() === data.child('hash').val() && newData.child('createdAt').val() === data.child('createdAt').val() && newData.child('expiresAt').val() === data.child('expiresAt').val() && newData.child('activatedAt').isNumber()))"
+      }
     },
     "keys": {
       ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
@@ -182,11 +233,6 @@ export const RECOMMENDED_RTDB_RULES = `{
   }
 }`;
 
-export async function call<T>(name: string, data?: Record<string, unknown>): Promise<T> {
-  const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
-  const result = await callable(data ?? {});
-  return result.data;
-}
 
 export async function beginGoogleSignIn(): Promise<User | null> {
   try {

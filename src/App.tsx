@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import {
-  auth, beginGoogleSignIn, call, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
+  auth, beginGoogleSignIn, db, rtdb, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
   rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
   enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut,
 } from "./firebase";
@@ -33,6 +33,22 @@ const nav: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "staff", label: "Сотрудники", icon: ShieldCheck },
   { id: "audit", label: "Журнал аудита", icon: Clock3 },
 ];
+
+const ZBT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function makeZbtKey(): string {
+  const bytes = new Uint8Array(16);
+  let payload = "";
+  while (payload.length < 12) {
+    crypto.getRandomValues(bytes);
+    for (const byte of bytes) {
+      if (byte >= 252) continue;
+      payload += ZBT_ALPHABET[byte % ZBT_ALPHABET.length];
+      if (payload.length === 12) break;
+    }
+  }
+  return `FL-${payload.slice(0, 4)}-${payload.slice(4, 8)}-${payload.slice(8, 12)}`;
+}
 
 function dateLabel(value?: number) {
   return value ? new Date(value).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" }) : "—";
@@ -84,16 +100,16 @@ export default function App() {
   // Modals
   const [showCampaignForm, setShowCampaignForm] = useState(false);
   const [showInviteForm, setShowInviteForm] = useState(false);
-  const [showNewsForm, setShowNewsForm] = useState(false);
-  const [showDbModal, setShowDbModal] = useState(false);
+    const [showNewsForm, setShowNewsForm] = useState(false);
+    const [showDbModal, setShowDbModal] = useState(false);
 
-  // Form states
-  const [campaignName, setCampaignName] = useState("");
+    // Form states
+    const [campaignName, setCampaignName] = useState("");
   const [campaignSeats, setCampaignSeats] = useState(50);
   const [campaignExpiry, setCampaignExpiry] = useState("");
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [inviteUid, setInviteUid] = useState("");
-  const [inviteRole, setInviteRole] = useState<Role>("support");
+    const [inviteEmail, setInviteEmail] = useState("");
+    const [inviteUid, setInviteUid] = useState("");
+    const [inviteRole, setInviteRole] = useState<Role>("support");
   const [newsTitle, setNewsTitle] = useState("");
   const [newsBody, setNewsBody] = useState("");
   const [newsStatus, setNewsStatus] = useState("DRAFT");
@@ -103,7 +119,6 @@ export default function App() {
   const mfaVerifier = useRef<RecaptchaVerifier | null>(null);
   const createdKeysByHash = useRef(new Map<string, string>());
 
-  // RTDB Diagnostics state
   const [rtdbDiag, setRtdbDiag] = useState<{ testing: boolean; tested: boolean; canRead: boolean; canWrite: boolean; message: string }>({
     testing: false,
     tested: false,
@@ -169,6 +184,36 @@ export default function App() {
       setCampaigns(liveCampaigns);
     }, (cause) => setError(errorText(cause)));
   }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
+    if (!user || !secondFactor || !role || role === "marketing") return;
+    const recordsByPath: Record<string, Record<string, ZbtKey>> = {};
+    const refreshCounts = () => {
+      const counts = new Map<string, number>();
+      for (const path of ["zbtKeys", "keys"] as const) {
+        for (const value of Object.values(recordsByPath[path] || {})) {
+          if (!value?.campaignId || !(value.used || ["ACTIVATED", "USED", "REDEEMED"].includes(value.status))) continue;
+          counts.set(value.campaignId, (counts.get(value.campaignId) || 0) + 1);
+        }
+      }
+      setCampaigns((previous) => previous.map((campaign) => ({
+        ...campaign,
+        activatedCount: counts.get(campaign.id) || 0,
+      })));
+    };
+    const unsubscribeLegacy = rtdbSubscribe<Record<string, ZbtKey>>("zbtKeys", (records) => {
+      recordsByPath.zbtKeys = records || {};
+      refreshCounts();
+    }, (cause) => setError(errorText(cause)));
+    const unsubscribeCanonical = rtdbSubscribe<Record<string, ZbtKey>>("keys", (records) => {
+      recordsByPath.keys = records || {};
+      refreshCounts();
+    }, (cause) => setError(errorText(cause)));
+    return () => {
+      unsubscribeLegacy();
+      unsubscribeCanonical();
+    };
+  }, [user, secondFactor, role]);
 
   useEffect(() => {
     if (!user || !secondFactor || !role || page !== "zbt" || !selectedCampaign) return;
@@ -442,37 +487,52 @@ export default function App() {
     setError("");
     try {
       const expiresAtMs = campaignExpiry ? new Date(campaignExpiry).getTime() : null;
-      const created = await call<{ campaignId: string; name: string; seats: number; keys: string[] }>("createZbtCampaign", {
-        name: campaignName.trim(),
-        seats: campaignSeats,
-        expiresAtMs,
-      });
+      const campaignId = `zbt_${crypto.randomUUID()}`;
+      const generatedKeys = Array.from({ length: campaignSeats }, makeZbtKey);
       const createdAt = Date.now();
       const campaignPayload: Campaign = {
-        id: created.campaignId,
-        name: created.name,
-        seats: created.seats,
+        id: campaignId,
+        name: campaignName.trim(),
+        seats: campaignSeats,
         status: "ACTIVE",
         activatedCount: 0,
         createdAt,
         expiresAt: expiresAtMs,
       };
-      const newKeysList: ZbtKey[] = await Promise.all(created.keys.map(async (rawKey) => ({
+      const newKeysList: ZbtKey[] = await Promise.all(generatedKeys.map(async (rawKey) => ({
         id: await hashZbtKey(rawKey),
         rawKey,
         storagePath: "keys",
-        campaignId: created.campaignId,
+        campaignId,
         status: "UNUSED",
         createdAt,
       })));
+
+      const updates: Record<string, unknown> = {
+        [`zbtCampaigns/${campaignId}`]: campaignPayload,
+      };
+      newKeysList.forEach((key) => {
+        updates[`keys/${key.id}`] = {
+          campaignId,
+          campaignName: campaignPayload.name,
+          hash: key.id,
+          status: "UNUSED",
+          used: false,
+          createdAt,
+          expiresAt: expiresAtMs,
+        };
+      });
+      const write = await rtdbUpdate("", updates);
+      if (!write.success) throw new Error(write.error || "Не вдалося записати кампанію та ключі в RTDB.");
+
       for (const key of newKeysList) {
         if (key.rawKey) createdKeysByHash.current.set(key.id, key.rawKey);
       }
 
       setCampaigns((previous) => [campaignPayload, ...previous]);
       setKeys((previous) => [...newKeysList, ...previous]);
-      setSelectedCampaign(created.campaignId);
-      const csvContent = "index,key,campaign,status\n" + created.keys.map((key, index) => `${index + 1},${key},${campaignPayload.name},UNUSED`).join("\n");
+      setSelectedCampaign(campaignId);
+      const csvContent = "index,key,campaign,status\n" + generatedKeys.map((key, index) => `${index + 1},${key},${campaignPayload.name},UNUSED`).join("\n");
       const file = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(file);
@@ -520,7 +580,8 @@ export default function App() {
 
   async function setCampaignStatus(campaignId: string, status: string) {
     try {
-      await call("setCampaignStatus", { campaignId, status });
+      const result = await rtdbUpdate(`zbtCampaigns/${campaignId}`, { status, updatedAt: Date.now() });
+      if (!result.success) throw new Error(result.error || "Не вдалося оновити кампанію в RTDB.");
       setCampaigns((prev) => prev.map((campaign) => campaign.id === campaignId ? { ...campaign, status } : campaign));
       setNotice(`Статус кампании обновлён: ${status}`);
     } catch (cause) {
@@ -528,10 +589,11 @@ export default function App() {
     }
   }
 
-  async function revokeKey(keyId: string, storagePath: "keys" | "zbtKeys" = "zbtKeys") {
+  async function revokeKey(keyId: string, storagePath: "keys" | "zbtKeys" = "keys") {
     if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
     try {
-      await call("revokeZbtKey", { keyId, storagePath });
+      const result = await rtdbUpdate(`${storagePath}/${keyId}`, { status: "REVOKED", revoked: true, revokedAt: Date.now() });
+      if (!result.success) throw new Error(result.error || "Не вдалося відкликати ключ у RTDB.");
       setKeys((prev) => prev.map((key) => key.id === keyId ? { ...key, status: "REVOKED" } : key));
       setNotice("Ключ ЗБТ отозван.");
     } catch (cause) {
