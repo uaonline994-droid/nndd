@@ -68,8 +68,8 @@ function errorText(error: unknown) {
   if (typeof error === "object" && error && "message" in error) {
     const code = "code" in error ? String((error as { code: unknown }).code || "") : "";
     const message = String((error as { message: unknown }).message).replace(/^Firebase: /, "");
-    if (code === "database/permission-denied") {
-      return "Realtime Database отклонила операцию. Проверьте роль owner и правила RTDB.";
+    if (code === "database/permission-denied" || /PERMISSION_DENIED|permission denied/i.test(message)) {
+      return "RTDB запретила запись. Разверните актуальные database.rules.json и проверьте, что в staff/{UID} указана роль owner, а вход в CRM подтверждён MFA.";
     }
     return message;
   }
