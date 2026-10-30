@@ -14,7 +14,6 @@ import {
   type User,
 } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
-import { getFunctions, httpsCallable } from "firebase/functions";
 import {
   getDatabase,
   ref,
@@ -25,6 +24,7 @@ import {
   child,
   push,
   onValue,
+  runTransaction,
   type Database,
 } from "firebase/database";
 
@@ -43,7 +43,6 @@ const firebaseConfig = {
 export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
-export const functions = getFunctions(app, "europe-west1");
 export const rtdb: Database = getDatabase(app, RTDB_URL);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
@@ -71,6 +70,17 @@ export async function rtdbUpdate(path: string, data: object): Promise<{ success:
   }
 }
 
+export async function rtdbTransaction<T>(
+  path: string,
+  updateValue: (current: T | null) => T | null | undefined,
+): Promise<{ committed: boolean; value: T | null }> {
+  const result = await runTransaction(ref(rtdb, path), (current) => updateValue(current as T | null));
+  return {
+    committed: result.committed,
+    value: result.snapshot.exists() ? result.snapshot.val() as T : null,
+  };
+}
+
 export async function rtdbRemove(path: string): Promise<{ success: boolean; error?: string }> {
   try {
     await remove(ref(rtdb, path));
@@ -89,11 +99,6 @@ export async function rtdbGet<T>(path: string): Promise<T | null> {
 
 export function rtdbSubscribe<T>(path: string, onData: (value: T | null) => void, onError?: (error: Error) => void) {
   return onValue(ref(rtdb, path), (snapshot) => onData(snapshot.exists() ? snapshot.val() as T : null), onError);
-}
-
-export async function callFunction<T>(name: string, data: Record<string, unknown> = {}): Promise<T> {
-  const callable = httpsCallable<Record<string, unknown>, T>(functions, name);
-  return (await callable(data)).data;
 }
 
 // Test live read/write access to RTDB
@@ -208,6 +213,37 @@ export const RECOMMENDED_RTDB_RULES = `{
       "$keyHash": {
         ".read": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')) || data.child('used').val() === false || data.child('usedBy').val() === auth.uid)",
         ".write": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner') || (data.exists() && data.child('used').val() === false && data.child('status').val() === 'UNUSED' && data.child('revoked').val() !== true && newData.child('used').val() === true && newData.child('status').val() === 'ACTIVATED' && newData.child('revoked').val() !== true && newData.child('usedBy').val() === auth.uid && newData.child('installId').isString() && newData.child('campaignId').val() === data.child('campaignId').val() && root.child('zbtCampaigns').child(data.child('campaignId').val()).child('status').val() === 'ACTIVE' && newData.child('hash').val() === data.child('hash').val() && newData.child('createdAt').val() === data.child('createdAt').val() && newData.child('expiresAt').val() === data.child('expiresAt').val() && newData.child('activatedAt').isNumber()))"
+      }
+    },
+    "shop_items": {
+      ".read": "auth != null",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
+    "orders": {
+      ".indexOn": ["createdAt", "paymentMethod", "receiptReviewDeadlineAt"],
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'",
+      "$orderId": {
+        ".read": "auth != null && (data.child('uid').val() === auth.uid || (auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'))",
+        ".write": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner') || (!data.exists() && auth.token.firebase.sign_in_provider !== 'anonymous' && newData.child('uid').val() === auth.uid && newData.child('status').val() === 'pending' && newData.child('createdAt').isNumber() && newData.child('itemId').isString() && root.child('shop_items').child(newData.child('itemId').val()).child('enabled').val() === true && newData.child('itemType').val() === root.child('shop_items').child(newData.child('itemId').val()).child('type').val() && newData.child('baseAmount').isNumber() && newData.child('baseAmount').val() > 0 && newData.child('amount').isNumber() && ((newData.child('paymentMethod').val() === 'card' && newData.child('currency').val() === 'UAH' && newData.child('baseAmount').val() === root.child('shop_items').child(newData.child('itemId').val()).child('priceUah').val() && newData.child('amount').val() >= newData.child('baseAmount').val() && newData.child('amount').val() < newData.child('baseAmount').val() + 1) || (newData.child('paymentMethod').val() === 'crypto' && newData.child('currency').val() === 'USDT' && newData.child('baseAmount').val() === root.child('shop_items').child(newData.child('itemId').val()).child('priceUsdt').val() && newData.child('amount').val() === newData.child('baseAmount').val())) && ((newData.child('itemType').val() !== 'tag' && newData.child('tag').val() === null) || (newData.child('itemType').val() === 'tag' && newData.child('tag').isString()))) || (!newData.exists() && data.child('uid').val() === auth.uid && data.child('status').val() === 'pending'))"
+      }
+    },
+    "analytics": {
+      "sales": {
+        ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support' || root.child('staff').child(auth.uid).child('role').val() === 'marketing')",
+        ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+      }
+    },
+    "entitlements": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+      }
+    },
+    "tags": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'",
+      "$tag": {
+        ".read": "auth != null && (data.child('uid').val() === auth.uid || (auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'))",
+        ".write": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner') || (!data.exists() && newData.child('uid').val() === auth.uid && newData.child('status').val() === 'reserved' && newData.child('orderId').isString() && newData.child('itemId').isString() && root.child('shop_items').child(newData.child('itemId').val()).child('enabled').val() === true && root.child('shop_items').child(newData.child('itemId').val()).child('type').val() === 'tag' && root.child('orders').child(newData.child('orderId').val()).child('uid').val() === auth.uid && root.child('orders').child(newData.child('orderId').val()).child('tag').val() === $tag && root.child('orders').child(newData.child('orderId').val()).child('itemId').val() === newData.child('itemId').val() && root.child('orders').child(newData.child('orderId').val()).child('status').val() === 'pending') || (!newData.exists() && data.child('uid').val() === auth.uid && data.child('status').val() === 'reserved' && !root.child('orders').child(data.child('orderId').val()).exists()))"
       }
     },
     "news": {

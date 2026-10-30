@@ -116,7 +116,7 @@ export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
             <label>Опис<textarea maxLength={400} rows={2} value={form.description || ""} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
             <div className="shop-form-grid">
               <label>Тип<select value={form.type} onChange={(event) => setForm({ ...form, type: event.target.value })}>
-                <option value="tag">Унікальний тег</option><option value="vip">VIP</option><option value="cape">Плащ</option><option value="subscription">Підписка</option>
+                <option value="tag">Унікальний тег</option><option value="vip">VIP</option><option value="cape">Плащ</option><option value="subscription">Підписка</option><option value="donation">Підтримка проєкту</option>
               </select></label>
               <label>Іконка URL<input maxLength={500} value={form.iconUrl || ""} onChange={(event) => setForm({ ...form, iconUrl: event.target.value })} /></label>
               <label>Ціна, UAH<input type="number" min="0" step="0.01" required value={form.priceUah} onChange={(event) => setForm({ ...form, priceUah: Number(event.target.value) })} /></label>

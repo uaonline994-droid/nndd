@@ -11,7 +11,7 @@ import { SalesDashboard, type ShopOrder } from "./SalesDashboard";
 import {
   auth, beginGoogleSignIn, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
   rtdbTestAccess, RECOMMENDED_RTDB_RULES, RTDB_RULES_URL, RTDB_DATA_URL, RTDB_URL,
-  enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut, callFunction,
+  enrollPhoneMfa, isSecondFactorSession, multiFactor, RecaptchaVerifier, signOut, rtdbTransaction,
 } from "./firebase";
 
 type Role = "owner" | "support" | "marketing";
@@ -68,8 +68,8 @@ function errorText(error: unknown) {
   if (typeof error === "object" && error && "message" in error) {
     const code = "code" in error ? String((error as { code: unknown }).code || "") : "";
     const message = String((error as { message: unknown }).message).replace(/^Firebase: /, "");
-    if (code === "functions/internal") {
-      return "Ошибка Firebase Cloud Function. Откройте логи функции в Firebase Console и проверьте подробности операции.";
+    if (code === "database/permission-denied") {
+      return "Realtime Database отклонила операцию. Проверьте роль owner и правила RTDB.";
     }
     return message;
   }
@@ -395,14 +395,17 @@ export default function App() {
       }
 
       if (target === "shop") {
-        const result = await callFunction<{ items: Record<string, Omit<ShopItem, "id">>; tags: Record<string, Omit<ShopTag, "tag">> }>("listShopItems");
-        setShopItems(recordRows(result.items) as ShopItem[]);
-        setShopTags(Object.entries(result.tags || {}).map(([tag, value]) => ({ tag, ...value })));
+        const [items, tags] = await Promise.all([
+          rtdbGet<Record<string, Omit<ShopItem, "id">>>("shop_items"),
+          rtdbGet<Record<string, Omit<ShopTag, "tag">>>("tags"),
+        ]);
+        setShopItems(recordRows(items) as ShopItem[]);
+        setShopTags(Object.entries(tags || {}).map(([tag, value]) => ({ tag, ...value })));
       }
 
       if (target === "sales") {
-        const result = await callFunction<{ orders: Record<string, Omit<ShopOrder, "id">> }>("listShopOrders");
-        setShopOrders(recordRows(result.orders) as ShopOrder[]);
+        const orders = await rtdbGet<Record<string, Omit<ShopOrder, "id">>>("orders");
+        setShopOrders(recordRows(orders).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)) as ShopOrder[]);
       }
     } catch (err) {
       console.warn("loadPage error:", err);
@@ -688,7 +691,26 @@ export default function App() {
 
   async function saveShopItem(item: Omit<ShopItem, "id">, itemId?: string) {
     try {
-      await callFunction<{ itemId: string }>("saveShopItem", { itemId: itemId || null, item });
+      const timestamp = Date.now();
+      const existing = itemId ? await rtdbGet<ShopItem & { createdAt?: number }>(`shop_items/${itemId}`) : null;
+      const payload = {
+        ...item,
+        createdAt: existing?.createdAt || timestamp,
+        updatedAt: timestamp,
+        salesCount: existing?.salesCount || 0,
+        priceHistory: existing?.priceHistory || {},
+      };
+      const savedItemId = itemId || `shop_${crypto.randomUUID()}`;
+      const result = itemId
+        ? await rtdbUpdate(`shop_items/${savedItemId}`, payload)
+        : await rtdbSet(`shop_items/${savedItemId}`, payload);
+      if (!result.success) throw new Error(result.error || "Не удалось сохранить товар в RTDB.");
+      await rtdbSet(`auditLog/audit_${timestamp}_${crypto.randomUUID()}`, {
+        actorUid: user?.uid || "unknown",
+        action: itemId ? "shop.item.updated" : "shop.item.created",
+        payload: { itemId: savedItemId, name: item.name, enabled: item.enabled },
+        at: timestamp,
+      });
       setNotice(itemId ? "Товар оновлено." : "Товар додано до каталогу.");
     } catch (cause) {
       setError(errorText(cause));
@@ -704,7 +726,110 @@ export default function App() {
     };
     if (!window.confirm(prompts[action])) return;
     try {
-      await callFunction("reviewShopOrder", { orderId, action });
+      type ReviewOrder = ShopOrder & {
+        tag?: string | null;
+        itemType?: string;
+        completedAt?: number;
+        reviewedAt?: number;
+        reviewedBy?: string;
+        updatedAt?: number;
+      };
+      const before = await rtdbGet<ReviewOrder>(`orders/${orderId}`);
+      if (!before) throw new Error("Заказ не найден в RTDB.");
+      if (action === "complete" && before.tag) {
+        const tag = await rtdbGet<ShopTag>(`tags/${before.tag}`);
+        if (!tag || tag.orderId !== orderId) throw new Error("Резервация тега потеряна. Проверьте заказ вручную.");
+      }
+
+      const timestamp = Date.now();
+      const transition = await rtdbTransaction<ReviewOrder>(`orders/${orderId}`, (current) => {
+        if (!current) return;
+        if (action === "complete" && ["pending", "under_review"].includes(current.status)) {
+          return { ...current, status: "completed", completedAt: timestamp, reviewedAt: timestamp, reviewedBy: user?.uid || "owner", updatedAt: timestamp };
+        }
+        if (action === "reject" && ["pending", "under_review"].includes(current.status)) {
+          return { ...current, status: "rejected", reviewedAt: timestamp, reviewedBy: user?.uid || "owner", updatedAt: timestamp };
+        }
+        if (action === "revoke" && current.status === "completed") {
+          return { ...current, status: "revoked", reviewedAt: timestamp, reviewedBy: user?.uid || "owner", updatedAt: timestamp };
+        }
+        return;
+      });
+      if (!transition.committed || !transition.value) throw new Error("Статус заказа уже изменился. Обновите список и проверьте его.");
+
+      const order = transition.value;
+      const updates: Record<string, unknown> = {
+        [`auditLog/audit_${timestamp}_${crypto.randomUUID()}`]: {
+          actorUid: user?.uid || "unknown",
+          action: `shop.order.${order.status}`,
+          payload: { orderId, uid: order.uid, email: order.email || null, itemId: order.itemId, amount: order.amount, currency: order.currency },
+          at: timestamp,
+        },
+      };
+
+      if (action === "complete") {
+        const completedAt = order.completedAt || timestamp;
+        updates[`analytics/sales/${orderId}`] = {
+          orderId,
+          uid: order.uid,
+          email: order.email || null,
+          nickname: order.nickname || null,
+          itemId: order.itemId,
+          itemName: order.itemName,
+          itemType: order.itemType || null,
+          tag: order.tag || null,
+          amount: order.amount,
+          currency: order.currency,
+          paymentMethod: order.paymentMethod,
+          completedAt,
+        };
+        updates[`entitlements/${order.uid}/${orderId}`] = {
+          orderId,
+          itemId: order.itemId,
+          itemName: order.itemName,
+          tag: order.tag || null,
+          status: "active",
+          activatedAt: completedAt,
+        };
+        if (order.tag) {
+          updates[`tags/${order.tag}/status`] = "active";
+          updates[`tags/${order.tag}/activatedAt`] = completedAt;
+        }
+      } else if (action === "revoke") {
+        updates[`entitlements/${order.uid}/${orderId}`] = null;
+        updates[`analytics/sales/${orderId}/revokedAt`] = timestamp;
+      }
+
+      const write = await rtdbUpdate("", updates);
+      if (!write.success) throw new Error(write.error || "Не удалось синхронизировать результат проверки с RTDB.");
+
+      if (action === "complete") {
+        await rtdbTransaction<ShopItem & { priceHistory?: Record<string, { price: number; currency: string; at: number; orderId: string }> }>(
+          `shop_items/${order.itemId}`,
+          (current) => {
+            if (!current) return;
+            const salesCount = Number(current.salesCount || 0) + 1;
+            if (!current.dynamicPrice) return { ...current, salesCount, updatedAt: timestamp };
+            const priceKey = order.currency === "UAH" ? "priceUah" : "priceUsdt";
+            const stepKey = order.currency === "UAH" ? "priceStepUah" : "priceStepUsdt";
+            const nextPrice = Math.round((Number(current[priceKey] || 0) + Number(current[stepKey] || 0)) * 100) / 100;
+            const historyKey = `price_${timestamp}_${crypto.randomUUID().slice(0, 8)}`;
+            return {
+              ...current,
+              [priceKey]: nextPrice,
+              salesCount,
+              updatedAt: timestamp,
+              priceHistory: {
+                ...(current.priceHistory || {}),
+                [historyKey]: { price: nextPrice, currency: order.currency, at: timestamp, orderId },
+              },
+            };
+          },
+        );
+      } else if ((action === "reject" || action === "revoke") && order.tag) {
+        await rtdbTransaction<ShopTag>(`tags/${order.tag}`, (current) => current?.orderId === orderId ? null : undefined);
+      }
+
       setNotice(action === "revoke" ? "Покупку відкликано; повернення коштів не виконувалося." : "Статус замовлення оновлено.");
       await loadPage("sales");
     } catch (cause) {
