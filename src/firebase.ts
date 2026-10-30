@@ -137,6 +137,7 @@ export const RECOMMENDED_RTDB_RULES = `{
       }
     },
     "players": {
+      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
       "$uid": {
         ".read": "auth != null && (auth.uid === $uid || (auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support'))) ",
         ".write": "auth != null && auth.uid === $uid",
@@ -208,10 +209,6 @@ export const RECOMMENDED_RTDB_RULES = `{
         ".read": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')) || data.child('used').val() === false || data.child('usedBy').val() === auth.uid)",
         ".write": "auth != null && ((auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner') || (data.exists() && data.child('used').val() === false && data.child('status').val() === 'UNUSED' && data.child('revoked').val() !== true && newData.child('used').val() === true && newData.child('status').val() === 'ACTIVATED' && newData.child('revoked').val() !== true && newData.child('usedBy').val() === auth.uid && newData.child('installId').isString() && newData.child('campaignId').val() === data.child('campaignId').val() && root.child('zbtCampaigns').child(data.child('campaignId').val()).child('status').val() === 'ACTIVE' && newData.child('hash').val() === data.child('hash').val() && newData.child('createdAt').val() === data.child('createdAt').val() && newData.child('expiresAt').val() === data.child('expiresAt').val() && newData.child('activatedAt').isNumber()))"
       }
-    },
-    "keys": {
-      ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && (root.child('staff').child(auth.uid).child('role').val() === 'owner' || root.child('staff').child(auth.uid).child('role').val() === 'support')",
-      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     },
     "news": {
       ".read": true,

@@ -66,7 +66,12 @@ async function hashZbtKey(displayKey: string): Promise<string> {
 
 function errorText(error: unknown) {
   if (typeof error === "object" && error && "message" in error) {
-    return String((error as { message: unknown }).message).replace(/^Firebase: /, "");
+    const code = "code" in error ? String((error as { code: unknown }).code || "") : "";
+    const message = String((error as { message: unknown }).message).replace(/^Firebase: /, "");
+    if (code === "functions/internal") {
+      return "Ошибка Firebase Cloud Function. Откройте логи функции в Firebase Console и проверьте подробности операции.";
+    }
+    return message;
   }
   return "Не удалось выполнить операцию.";
 }
@@ -89,6 +94,7 @@ export default function App() {
 
   // Optimistic data states initialized from LocalStorage
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [activatedCounts, setActivatedCounts] = useState<Record<string, number>>({});
   const [players, setPlayers] = useState<Player[]>([]);
   const [errors, setErrors] = useState<CrmError[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
@@ -185,6 +191,33 @@ export default function App() {
   }, [user, secondFactor, role, page]);
 
   useEffect(() => {
+    if (!user || !secondFactor || !role || role === "marketing" || !["overview", "analytics", "players"].includes(page)) return;
+    let playerRecords: Record<string, Player> = {};
+    let banRecords: Record<string, { bannedAt?: number; reason?: string }> = {};
+    const publishPlayers = () => {
+      const currentPlayers = Object.entries(playerRecords).map(([uid, player]) => ({
+        ...player,
+        uid,
+        status: banRecords[uid] ? "BANNED" : player.status || "ACTIVE",
+      }));
+      setPlayers(currentPlayers);
+      setOverview((current) => current ? { ...current, playerCount: currentPlayers.length } : current);
+    };
+    const unsubscribePlayers = rtdbSubscribe<Record<string, Player>>("players", (records) => {
+      playerRecords = records || {};
+      publishPlayers();
+    }, (cause) => setError(errorText(cause)));
+    const unsubscribeBans = rtdbSubscribe<Record<string, { bannedAt?: number; reason?: string }>>("bans", (records) => {
+      banRecords = records || {};
+      publishPlayers();
+    }, (cause) => setError(errorText(cause)));
+    return () => {
+      unsubscribePlayers();
+      unsubscribeBans();
+    };
+  }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
     if (!user || !secondFactor || !role || page !== "zbt") return;
     return rtdbSubscribe<Record<string, Campaign>>("zbtCampaigns", (records) => {
       const liveCampaigns = Object.entries(records || {}).map(([id, value]) => ({ ...value, id }));
@@ -197,16 +230,20 @@ export default function App() {
     const recordsByPath: Record<string, Record<string, ZbtKey>> = {};
     const refreshCounts = () => {
       const counts = new Map<string, number>();
+      const keysById = new Map<string, ZbtKey>();
       for (const path of ["zbtKeys", "keys"] as const) {
-        for (const value of Object.values(recordsByPath[path] || {})) {
-          if (!value?.campaignId || !(value.used || ["ACTIVATED", "USED", "REDEEMED"].includes(value.status))) continue;
-          counts.set(value.campaignId, (counts.get(value.campaignId) || 0) + 1);
+        for (const [id, value] of Object.entries(recordsByPath[path] || {})) {
+          const previous = keysById.get(id);
+          const previousUsed = Boolean(previous?.used || ["ACTIVATED", "USED", "REDEEMED"].includes(previous?.status || ""));
+          const currentUsed = Boolean(value?.used || ["ACTIVATED", "USED", "REDEEMED"].includes(value?.status || ""));
+          if (!previous || currentUsed || !previousUsed) keysById.set(id, value);
         }
       }
-      setCampaigns((previous) => previous.map((campaign) => ({
-        ...campaign,
-        activatedCount: counts.get(campaign.id) || 0,
-      })));
+      for (const value of keysById.values()) {
+        if (!value?.campaignId || !(value.used || ["ACTIVATED", "USED", "REDEEMED"].includes(value.status))) continue;
+        counts.set(value.campaignId, (counts.get(value.campaignId) || 0) + 1);
+      }
+      setActivatedCounts(Object.fromEntries(counts));
     };
     const unsubscribeLegacy = rtdbSubscribe<Record<string, ZbtKey>>("zbtKeys", (records) => {
       recordsByPath.zbtKeys = records || {};
@@ -775,6 +812,10 @@ export default function App() {
   }
 
   const currentPage = nav.find((item) => item.id === page) || nav[0];
+  const campaignsWithCounts = campaigns.map((campaign) => ({
+    ...campaign,
+    activatedCount: activatedCounts[campaign.id] ?? campaign.activatedCount ?? 0,
+  }));
   const visibleNav = nav.filter((item) => {
     if (item.id === "staff" || item.id === "audit") return role === "owner";
     if (item.id === "shop" || item.id === "sales") return role === "owner";
@@ -937,14 +978,14 @@ export default function App() {
           {page === "overview" && (
             <OverviewPage
               overview={overview}
-              campaigns={campaigns}
+              campaigns={campaignsWithCounts}
               errors={errors}
               openPage={setPage}
             />
           )}
           {page === "zbt" && (
             <ZbtPage
-              campaigns={campaigns}
+              campaigns={campaignsWithCounts}
               keys={keys}
               selectedCampaign={selectedCampaign}
               selectCampaign={loadKeys}
