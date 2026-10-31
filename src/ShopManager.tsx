@@ -11,7 +11,15 @@ export type ShopItem = {
   priceUah: number;
   priceUsdt: number;
   iconUrl?: string | null;
+  assets?: { icon?: string; iconOpen?: string };
   enabled: boolean;
+  rarity?: "common" | "rare" | "epic" | "legendary";
+  category?: string;
+  sortOrder?: number;
+  giftable?: boolean;
+  limited?: boolean;
+  stock?: number | null;
+  priceCoins?: number;
   dynamicPrice?: boolean;
   priceStepUah?: number;
   priceStepUsdt?: number;
@@ -29,8 +37,11 @@ type ShopManagerProps = {
 
 const emptyItem: Omit<ShopItem, "id"> = {
   name: "", description: "", type: "tag", priceUah: 0, priceUsdt: 0,
-  enabled: true, dynamicPrice: false, priceStepUah: 0, priceStepUsdt: 0,
+  enabled: true, rarity: "common", category: "tags", sortOrder: 100, giftable: true,
+  limited: false, stock: null, dynamicPrice: false, priceStepUah: 0, priceStepUsdt: 0,
 };
+
+const categories = ["premium", "tags", "capes", "frames", "nick", "badges", "banners", "themes", "emoji", "cases", "gifts", "bundles", "currency"];
 
 export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
   const [form, setForm] = useState(emptyItem);
@@ -116,11 +127,27 @@ export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
             <label>Опис<textarea maxLength={400} rows={2} value={form.description || ""} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
             <div className="shop-form-grid">
               <label>Тип<select value={form.type} onChange={(event) => setForm({ ...form, type: event.target.value })}>
-                <option value="tag">Унікальний тег</option><option value="vip">VIP</option><option value="cape">Плащ</option><option value="subscription">Підписка</option><option value="donation">Підтримка проєкту</option>
+                <option value="coins">FL Coins</option><option value="premium">FL Premium</option><option value="tag">Тег</option>
+                <option value="cape">Плащ</option><option value="frame">Рамка</option><option value="nick_color">Цвет ника</option>
+                <option value="nick_effect">Эффект ника</option><option value="badge">Значок</option><option value="banner">Баннер</option>
+                <option value="theme">Тема</option><option value="emoji_pack">Набор эмодзи</option><option value="case">Кейс</option>
+                <option value="gift">Подарок</option><option value="bundle">Набор</option>
               </select></label>
-              <label>Іконка URL<input maxLength={500} value={form.iconUrl || ""} onChange={(event) => setForm({ ...form, iconUrl: event.target.value })} /></label>
-              <label>Ціна, UAH<input type="number" min="0" step="0.01" required value={form.priceUah} onChange={(event) => setForm({ ...form, priceUah: Number(event.target.value) })} /></label>
-              <label>Ціна, USDT<input type="number" min="0" step="0.01" required value={form.priceUsdt} onChange={(event) => setForm({ ...form, priceUsdt: Number(event.target.value) })} /></label>
+              <label>Категория<select value={form.category || "other"} onChange={(event) => setForm({ ...form, category: event.target.value })}>
+                {categories.map((category) => <option value={category} key={category}>{category}</option>)}
+              </select></label>
+              <label>Редкость<select value={form.rarity || "common"} onChange={(event) => setForm({ ...form, rarity: event.target.value as ShopItem["rarity"] })}>
+                <option value="common">Обычная</option>
+                <option value="rare">Редкая</option>
+                <option value="epic">Эпическая</option>
+                <option value="legendary">Легендарная</option>
+              </select></label>
+              <label>Порядок<input type="number" min="0" step="1" value={form.sortOrder || 0} onChange={(event) => setForm({ ...form, sortOrder: Number(event.target.value) })} /></label>
+              <label>Иконка / путь<input maxLength={500} value={form.assets?.icon || form.iconUrl || ""} onChange={(event) => setForm({ ...form, assets: { ...form.assets, icon: event.target.value } })} /></label>
+              <label>Цена, UAH<input type="number" min="50" step="0.01" required value={form.priceUah} onChange={(event) => setForm({ ...form, priceUah: Number(event.target.value) })} /></label>
+              <label>Цена, USDT<input type="number" min="50" step="0.01" required value={form.priceUsdt} onChange={(event) => setForm({ ...form, priceUsdt: Number(event.target.value) })} /></label>
+              {form.type !== "coins" && <label>Цена, FL Coins<input type="number" min="50" step="1" value={form.priceCoins ?? form.priceUah} onChange={(event) => setForm({ ...form, priceCoins: Number(event.target.value) })} /></label>}
+              {form.limited && <label>Остаток<input type="number" min="0" step="1" value={form.stock ?? ""} onChange={(event) => setForm({ ...form, stock: event.target.value === "" ? null : Number(event.target.value) })} /></label>}
             </div>
             {form.type === "tag" && <>
               <label className="shop-checkbox"><input type="checkbox" checked={Boolean(form.dynamicPrice)} onChange={(event) => setForm({ ...form, dynamicPrice: event.target.checked })} /> Автоматично підвищувати ціну після продажу</label>
@@ -130,6 +157,8 @@ export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
               </div>}
             </>}
             <label className="shop-checkbox"><input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} /> Доступний у лаунчері</label>
+            <label className="shop-checkbox"><input type="checkbox" checked={Boolean(form.limited)} onChange={(event) => setForm({ ...form, limited: event.target.checked })} /> Лимитированный товар</label>
+            <label className="shop-checkbox"><input type="checkbox" checked={form.giftable !== false} onChange={(event) => setForm({ ...form, giftable: event.target.checked })} /> Можно подарить</label>
             {saveError && <p className="shop-form-error">{saveError}</p>}
             <footer><button type="button" className="button secondary" onClick={() => setOpen(false)}>Скасувати</button><button className="button primary" disabled={saving}><Save size={14} /> {saving ? "Збереження" : "Зберегти"}</button></footer>
             {editingId && <span className="shop-editing"><Check size={12} /> Зміни одразу синхронізуються через Firebase</span>}
