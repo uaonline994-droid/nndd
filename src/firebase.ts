@@ -220,6 +220,14 @@ export const RECOMMENDED_RTDB_RULES = `{
       ".read": "auth != null",
       ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
     },
+    "shop_config": {
+      ".read": "auth != null",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
+    "case_drops": {
+      ".read": "auth != null",
+      ".write": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'"
+    },
     "orders": {
       ".indexOn": ["createdAt", "paymentMethod", "receiptReviewDeadlineAt"],
       ".read": "auth != null && auth.token.firebase.sign_in_second_factor != null && root.child('staff').child(auth.uid).child('role').val() === 'owner'",

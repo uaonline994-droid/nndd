@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { Check, Eye, EyeOff, Pencil, Plus, Save, X } from "lucide-react";
+import { Check, Eye, EyeOff, Pencil, Plus, Save, Upload, X } from "lucide-react";
 import { isTagItem } from "./modules/shop_manager.js";
 import { nextDynamicPrice } from "./modules/tags_exchange.js";
 
@@ -25,14 +25,23 @@ export type ShopItem = {
   priceStepUsdt?: number;
   salesCount?: number;
   priceHistory?: Record<string, { price: number; currency: string; at: number }>;
+  createdAt?: number;
+  updatedAt?: number;
+  metadata?: { coinAmount?: number; includes?: unknown[]; grants?: Array<{ itemId?: string }>; [key: string]: unknown };
 };
 
 export type ShopTag = { tag: string; uid: string; itemId: string; orderId: string; status: string; reservedAt?: number; activatedAt?: number };
+export type ShopSeedCatalog = {
+  items: Record<string, Omit<ShopItem, "id">>;
+  drops: Record<string, Array<{ kind: "item" | "coins"; itemId?: string; amount?: number; weight: number }>>;
+  config: { minPriceUah: number; usdtPerUah: number; coinsPerUah: number; [key: string]: unknown };
+};
 
 type ShopManagerProps = {
   items: ShopItem[];
   tags: ShopTag[];
   onSave: (item: Omit<ShopItem, "id">, itemId?: string) => Promise<void>;
+  onPublishCatalog: (catalog: ShopSeedCatalog) => Promise<void>;
 };
 
 const emptyItem: Omit<ShopItem, "id"> = {
@@ -43,12 +52,73 @@ const emptyItem: Omit<ShopItem, "id"> = {
 
 const categories = ["premium", "tags", "capes", "frames", "nick", "badges", "banners", "themes", "emoji", "cases", "gifts", "bundles", "currency"];
 
-export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
+function validateCatalog(catalog: ShopSeedCatalog): string[] {
+  const errors: string[] = [];
+  if (!catalog || !catalog.items || typeof catalog.items !== "object" || Array.isArray(catalog.items)) return ["Файл товаров должен содержать JSON-объект."];
+  if (!catalog.config || typeof catalog.config !== "object" || Array.isArray(catalog.config) ||
+    !catalog.drops || typeof catalog.drops !== "object" || Array.isArray(catalog.drops)) return ["Не удалось прочитать config или таблицы дропа."];
+  const itemEntries = Object.entries(catalog.items);
+  if (!Number.isFinite(catalog.config?.minPriceUah) || catalog.config.minPriceUah < 50) errors.push("Минимальная цена должна быть не ниже 50 UAH.");
+  if (!Number.isFinite(catalog.config?.usdtPerUah) || catalog.config.usdtPerUah <= 0) errors.push("Некорректный курс USDT.");
+  if (!Number.isFinite(catalog.config?.coinsPerUah) || catalog.config.coinsPerUah <= 0) errors.push("Некорректный курс FL Coins.");
+  if (itemEntries.length !== 69) errors.push(`Ожидалось 69 товаров, получено ${itemEntries.length}.`);
+  if (Object.keys(catalog.drops || {}).length !== 8) errors.push(`Ожидалось 8 таблиц дропа, получено ${Object.keys(catalog.drops || {}).length}.`);
+
+  for (const [itemId, item] of itemEntries) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      errors.push(`${itemId}: запись товара должна быть объектом.`);
+      continue;
+    }
+    if (!/^[a-z0-9_]+$/.test(itemId)) errors.push(`${itemId}: некорректный ID.`);
+    if (typeof item.enabled !== "boolean" || typeof item.type !== "string" || !item.type.trim() ||
+      typeof item.name !== "string" || !item.name.trim()) errors.push(`${itemId}: обязательны enabled, type и name.`);
+    if (!Number.isFinite(item.priceUah) || item.priceUah < catalog.config.minPriceUah) errors.push(`${itemId}: цена ниже минимальной.`);
+    if (item.priceUsdt !== item.priceUah * catalog.config.usdtPerUah) errors.push(`${itemId}: цена USDT не совпадает с курсом.`);
+    if (!item.category?.trim() || !item.rarity) errors.push(`${itemId}: обязательны category и rarity.`);
+    if (item.type === "coins") {
+      if (item.priceCoins !== undefined || !Number.isInteger(item.metadata?.coinAmount)) errors.push(`${itemId}: неверный пакет FL Coins.`);
+    } else if (item.priceCoins !== item.priceUah * catalog.config.coinsPerUah) errors.push(`${itemId}: неверная цена в FL Coins.`);
+
+    const metadata = item.metadata || {};
+    const references = [
+      ...(Array.isArray(metadata.includes) ? metadata.includes : []),
+      ...(Array.isArray(metadata.grants) ? metadata.grants.map((grant) => grant?.itemId) : []),
+    ].filter((reference): reference is string => typeof reference === "string");
+    for (const reference of references) if (!Object.hasOwn(catalog.items, reference)) errors.push(`${itemId}: отсутствует связанный товар ${reference}.`);
+  }
+
+  for (const [caseId, entries] of Object.entries(catalog.drops || {})) {
+    if (catalog.items[caseId]?.type !== "case" || !Array.isArray(entries) || entries.length === 0) errors.push(`${caseId}: отсутствует кейс или таблица дропа.`);
+    const dropEntries = Array.isArray(entries) ? entries : [];
+    for (const entry of dropEntries) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        errors.push(`${caseId}: запись награды должна быть объектом.`);
+        continue;
+      }
+      if (!Number.isInteger(entry.weight) || entry.weight <= 0) errors.push(`${caseId}: каждый вес должен быть положительным целым числом.`);
+    }
+    const total = dropEntries.reduce((sum, entry) => sum + (Number.isInteger(entry.weight) ? entry.weight : 0), 0);
+    if (total !== 10000) errors.push(`${caseId}: сумма шансов должна быть 10000.`);
+    for (const entry of dropEntries) {
+      if (entry.kind === "item" && (!entry.itemId || !catalog.items[entry.itemId] || ["case", "bundle", "gift", "coins"].includes(catalog.items[entry.itemId].type))) errors.push(`${caseId}: предмет дропа отсутствует или запрещён.`);
+      if (entry.kind === "coins" && (!Number.isInteger(entry.amount) || Number(entry.amount) <= 0)) errors.push(`${caseId}: некорректная награда FL Coins.`);
+      if (entry.kind !== "item" && entry.kind !== "coins") errors.push(`${caseId}: неизвестный тип награды.`);
+    }
+  }
+  return errors;
+}
+
+export function ShopManager({ items, tags, onSave, onPublishCatalog }: ShopManagerProps) {
   const [form, setForm] = useState(emptyItem);
   const [editingId, setEditingId] = useState<string>();
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [seedItemsFile, setSeedItemsFile] = useState<File | null>(null);
+  const [seedDropsFile, setSeedDropsFile] = useState<File | null>(null);
+  const [seedConfigFile, setSeedConfigFile] = useState<File | null>(null);
+  const [seedBusy, setSeedBusy] = useState(false);
+  const [seedMessage, setSeedMessage] = useState("");
 
   function edit(item?: ShopItem) {
     setEditingId(item?.id);
@@ -80,12 +150,44 @@ export function ShopManager({ items, tags, onSave }: ShopManagerProps) {
     }
   }
 
+  async function publishCatalog() {
+    if (!seedItemsFile || !seedDropsFile || !seedConfigFile) return;
+    setSeedBusy(true);
+    setSeedMessage("");
+    try {
+      const [itemsSeed, dropsSeed, configSeed] = await Promise.all(
+        [seedItemsFile, seedDropsFile, seedConfigFile].map(async (file) => JSON.parse(await file.text())),
+      );
+      const catalog = { items: itemsSeed, drops: dropsSeed, config: configSeed } as ShopSeedCatalog;
+      const errors = validateCatalog(catalog);
+      if (errors.length) throw new Error(errors.slice(0, 8).join("\n"));
+      await onPublishCatalog(catalog);
+      setSeedMessage(`Опубликовано: ${Object.keys(catalog.items).length} товаров, ${Object.keys(catalog.drops).length} таблиц дропа.`);
+    } catch (error) {
+      setSeedMessage(error instanceof Error ? error.message : "Не удалось загрузить каталог.");
+    } finally {
+      setSeedBusy(false);
+    }
+  }
+
   return (
     <div className="shop-manager">
       <div className="shop-toolbar">
         <p>{items.length} товарів · {items.filter((item) => item.enabled).length} активних</p>
         <button className="button primary" onClick={() => edit()}><Plus size={15} /> Додати товар</button>
       </div>
+      <details className="sales-panel" style={{ marginBottom: 16 }}>
+        <summary style={{ cursor: "pointer", padding: 14, fontWeight: 700 }}><Upload size={15} /> Загрузить каталог и экономику из seed JSON</summary>
+        <div className="shop-form-grid" style={{ padding: 14 }}>
+          <label>shop_items.seed.json<input type="file" accept="application/json,.json" onChange={(event) => setSeedItemsFile(event.target.files?.[0] || null)} /></label>
+          <label>case_drops.seed.json<input type="file" accept="application/json,.json" onChange={(event) => setSeedDropsFile(event.target.files?.[0] || null)} /></label>
+          <label>shop_config.seed.json<input type="file" accept="application/json,.json" onChange={(event) => setSeedConfigFile(event.target.files?.[0] || null)} /></label>
+          <button className="button primary" disabled={seedBusy || !seedItemsFile || !seedDropsFile || !seedConfigFile} onClick={() => void publishCatalog()}>
+            <Upload size={14} /> {seedBusy ? "Публикация…" : "Опубликовать в RTDB"}
+          </button>
+          {seedMessage && <p className={seedMessage.startsWith("Опубликовано:") ? "shop-editing" : "shop-form-error"} style={{ whiteSpace: "pre-line" }}>{seedMessage}</p>}
+        </div>
+      </details>
       {saveError && !open && <p className="shop-form-error">{saveError}</p>}
       <div className="shop-table-wrap">
         <table className="shop-table">

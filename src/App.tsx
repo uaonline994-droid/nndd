@@ -6,7 +6,7 @@ import {
   Server, Lock, Sparkles, ExternalLink
 } from "lucide-react";
 import { onAuthStateChanged, type User } from "firebase/auth";
-import { ShopManager, type ShopItem, type ShopTag } from "./ShopManager";
+import { ShopManager, type ShopItem, type ShopSeedCatalog, type ShopTag } from "./ShopManager";
 import { SalesDashboard, type ShopOrder } from "./SalesDashboard";
 import {
   auth, beginGoogleSignIn, rtdbSet, rtdbGet, rtdbUpdate, rtdbRemove, rtdbSubscribe,
@@ -748,6 +748,56 @@ export default function App() {
     }
   }
 
+  async function publishShopCatalog(catalog: ShopSeedCatalog) {
+    if (!user || !secondFactor || role !== "owner") throw new Error("Публикация каталога доступна только владельцу с MFA.");
+    setBusy(true);
+    try {
+      const [currentItems, currentConfig] = await Promise.all([
+        rtdbGet<Record<string, ShopItem>>("shop_items"),
+        rtdbGet<Record<string, unknown> & { createdAt?: number }>("shop_config"),
+      ]);
+      const timestamp = Date.now();
+      const updates: Record<string, unknown> = {};
+      for (const [itemId, item] of Object.entries(catalog.items)) {
+        const existing = currentItems?.[itemId];
+        updates[`shop_items/${itemId}`] = {
+          ...item,
+          createdAt: existing?.createdAt || item.createdAt || timestamp,
+          updatedAt: timestamp,
+          salesCount: existing?.salesCount || 0,
+          priceHistory: existing?.priceHistory || {},
+        };
+      }
+      for (const [itemId, item] of Object.entries(currentItems || {})) {
+        const valid = Boolean(item.name?.trim() && item.category && Number(item.priceUah) >= catalog.config.minPriceUah &&
+          Number(item.priceUsdt) === Number(item.priceUah) * catalog.config.usdtPerUah);
+        if (!catalog.items[itemId] && item.enabled && !valid) {
+          updates[`shop_items/${itemId}/enabled`] = false;
+          updates[`shop_items/${itemId}/updatedAt`] = timestamp;
+        }
+      }
+      updates.case_drops = { ...catalog.drops, updatedAt: timestamp };
+      updates.shop_config = {
+        ...currentConfig,
+        ...catalog.config,
+        createdAt: currentConfig?.createdAt || timestamp,
+        updatedAt: timestamp,
+      };
+      updates[`auditLog/catalog_${timestamp}`] = {
+        actorUid: user.uid,
+        action: "shop.catalog.seeded",
+        payload: { itemCount: Object.keys(catalog.items).length, dropTableCount: Object.keys(catalog.drops).length },
+        at: timestamp,
+      };
+
+      const result = await rtdbUpdate("", updates);
+      if (!result.success) throw new Error(result.error || "Не удалось опубликовать каталог в RTDB.");
+      setNotice(`Каталог опубликован: ${Object.keys(catalog.items).length} товаров и ${Object.keys(catalog.drops).length} таблиц дропа.`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function reviewShopOrder(orderId: string, action: "complete" | "reject" | "revoke") {
     const prompts = {
       complete: "Підтверджуйте лише після перевірки фактичного надходження коштів. Активувати покупку?",
@@ -759,6 +809,11 @@ export default function App() {
       type ReviewOrder = ShopOrder & {
         tag?: string | null;
         itemType?: string;
+        receiptCode?: string;
+        receiptHash?: string;
+        receiptReceivedAt?: number;
+        telegramUserId?: string;
+        telegramChatId?: string;
         completedAt?: number;
         reviewedAt?: number;
         reviewedBy?: string;
@@ -811,6 +866,11 @@ export default function App() {
           amount: order.amount,
           currency: order.currency,
           paymentMethod: order.paymentMethod,
+          receiptCode: order.receiptCode || null,
+          receiptHash: order.receiptHash || null,
+          receiptReceivedAt: order.receiptReceivedAt || null,
+          telegramUserId: order.telegramUserId || null,
+          telegramChatId: order.telegramChatId || null,
           completedAt,
         };
         updates[`entitlements/${order.uid}/${orderId}`] = {
@@ -1180,7 +1240,7 @@ export default function App() {
             />
           )}
           {page === "analytics" && <AnalyticsPage overview={overview} />}
-          {page === "shop" && <ShopManager items={shopItems} tags={shopTags} onSave={saveShopItem} />}
+          {page === "shop" && <ShopManager items={shopItems} tags={shopTags} onSave={saveShopItem} onPublishCatalog={publishShopCatalog} />}
           {page === "sales" && <SalesDashboard orders={shopOrders} items={shopItems} onReview={reviewShopOrder} />}
           {page === "staff" && (
             <StaffPage

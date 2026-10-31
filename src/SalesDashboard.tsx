@@ -15,6 +15,12 @@ export type ShopOrder = {
   paymentMethod: string;
   status: string;
   createdAt: number;
+  receiptCode?: string;
+  receiptHash?: string;
+  receiptReceivedAt?: number;
+  completedAt?: number;
+  cryptoInvoiceId?: string;
+  telegramUserId?: string;
 };
 
 type SalesDashboardProps = {
@@ -24,6 +30,7 @@ type SalesDashboardProps = {
 };
 
 const money = (value: number, currency: string) => `${Number(value || 0).toFixed(2)} ${currency === "UAH" ? "₴" : currency}`;
+const dateLabel = (value?: number) => value ? new Date(value).toLocaleString("ru-RU") : "—";
 
 function PriceChart({ items }: { items: ShopItem[] }) {
   const points = priceSeries(items);
@@ -55,10 +62,11 @@ export function SalesDashboard({ orders, items, onReview }: SalesDashboardProps)
         <section className="sales-panel"><header><h2>Історія цін тегів</h2></header><PriceChart items={items} /></section>
       </div>
       <section className="sales-panel orders-panel"><header><h2>Замовлення</h2><small>{orders.length} останніх записів</small></header>
-        <div className="shop-table-wrap"><table className="shop-table"><thead><tr><th>Замовлення</th><th>Користувач</th><th>Сума</th><th>Статус</th><th>Дії</th></tr></thead>
+        <div className="shop-table-wrap"><table className="shop-table"><thead><tr><th>Замовлення</th><th>Користувач</th><th>Квитанція / час</th><th>Сума</th><th>Статус</th><th>Дії</th></tr></thead>
           <tbody>{recent.map((order) => <tr key={order.id}>
-            <td><strong>{order.itemName}</strong><small>{order.id} · {new Date(order.createdAt).toLocaleString()}</small></td>
-            <td><strong>{order.nickname || order.uid}</strong><small>{order.email || "Email не вказаний"} · UID {order.uid}</small></td>
+            <td><strong>{order.itemName}</strong><small>{order.id} · создано {dateLabel(order.createdAt)}</small></td>
+            <td><strong>{order.nickname || order.uid}</strong><small>{order.email || "Email не вказаний"} · UID {order.uid}{order.telegramUserId ? ` · Telegram ${order.telegramUserId}` : ""}</small></td>
+            <td><strong>{order.receiptCode || order.cryptoInvoiceId || "—"}</strong><small>{order.receiptReceivedAt ? `Получена ${dateLabel(order.receiptReceivedAt)}` : order.completedAt ? `Подтверждена ${dateLabel(order.completedAt)}` : "Ожидает оплату"}{order.receiptHash ? ` · ${order.receiptHash.slice(0, 12)}` : ""}</small></td>
             <td>{money(order.amount, order.currency)}<small>{order.paymentMethod === "crypto" ? "Crypto Pay" : "Переказ UAH"}</small></td>
             <td><span className={`shop-status ${order.status === "completed" ? "enabled" : ""}`}>{order.status}</span></td>
             <td className="shop-actions">{["pending", "under_review"].includes(order.status) && <>
@@ -66,7 +74,7 @@ export function SalesDashboard({ orders, items, onReview }: SalesDashboardProps)
               <button className="icon-button" title="Відхилити" onClick={() => void onReview(order.id, "reject")}><X size={15} /></button>
             </>}{order.status === "completed" && <button className="icon-button" title="Відкликати покупку" onClick={() => void onReview(order.id, "revoke")}><X size={15} /></button>}</td>
           </tr>)}
-          {!recent.length && <tr><td colSpan={5} className="shop-empty">Замовлень ще немає.</td></tr>}</tbody>
+          {!recent.length && <tr><td colSpan={6} className="shop-empty">Замовлень ще немає.</td></tr>}</tbody>
         </table></div>
       </section>
     </div>
