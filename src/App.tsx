@@ -17,7 +17,7 @@ import {
 type Role = "owner" | "support" | "marketing";
 type Page = "overview" | "zbt" | "players" | "errors" | "news" | "staff" | "analytics" | "audit" | "shop" | "sales";
 type Campaign = { id: string; name: string; seats: number; status: string; activatedCount: number; createdAt?: number; expiresAt?: number | null };
-type Player = { uid: string; nickname: string; contactEmail: string; status: string; zbtCampaignId?: string; lastSeenAt?: number };
+type Player = { uid: string; nickname: string; contactEmail: string; status: string; zbtCampaignId?: string; lastSeenAt?: number; launchCount?: number; totalPlayMinutes?: number; lastVersion?: string };
 type ZbtKey = { id: string; campaignId?: string; status: string; activatedBy?: string; usedBy?: string; nickname?: string; installId?: string; activatedAt?: number; usedAt?: number; used?: boolean; rawKey?: string; createdAt?: number; storagePath?: "keys" | "zbtKeys" };
 type CrmError = { id: string; fingerprint: string; title: string; area: string; status: string; occurrences: number; affectedPlayers: number; updatedAt?: number; version?: string };
 type Announcement = { id: string; title: string; body: string; status: string; updatedAt?: number; author?: string };
@@ -91,6 +91,7 @@ export default function App() {
   const [accessDiagnostic, setAccessDiagnostic] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [zbtEnabled, setZbtEnabled] = useState(false);
 
   // Optimistic data states initialized from LocalStorage
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -189,6 +190,13 @@ export default function App() {
     if (!user || !secondFactor || !role) return;
     void loadPage(page);
   }, [user, secondFactor, role, page]);
+
+  useEffect(() => {
+    if (!user || !secondFactor || role !== "owner") return;
+    return rtdbSubscribe<boolean>("config/zbtEnabled", (enabled) => {
+      setZbtEnabled(enabled ?? false);
+    }, (cause) => setError(errorText(cause)));
+  }, [user, secondFactor, role]);
 
   useEffect(() => {
     if (!user || !secondFactor || !role || role === "marketing" || !["overview", "analytics", "players"].includes(page)) return;
@@ -668,6 +676,28 @@ export default function App() {
     }
   }
 
+  async function setZbtTestingEnabled(enabled: boolean) {
+    if (!user || role !== "owner") return;
+    const timestamp = Date.now();
+    const result = await rtdbUpdate("", {
+      "config/zbtEnabled": enabled,
+      "config/zbtUpdatedAt": timestamp,
+      "config/zbtUpdatedBy": user.uid,
+      [`auditLog/audit_${timestamp}_${crypto.randomUUID()}`]: {
+        actorUid: user.uid,
+        action: enabled ? "zbt.testing.enabled" : "zbt.testing.disabled",
+        payload: { enabled },
+        at: timestamp,
+      },
+    });
+    if (!result.success) {
+      setError(`Не удалось изменить режим ЗБТ: ${result.error || "проверьте правила RTDB"}`);
+      return;
+    }
+    setZbtEnabled(enabled);
+    setNotice(enabled ? "Тестирование ЗБТ включено." : "Тестирование ЗБТ выключено; блокировка лаунчера снята.");
+  }
+
   async function revokeKey(keyId: string, storagePath: "keys" | "zbtKeys" = "keys") {
     if (!window.confirm("Отозвать этот ключ? Доступ игрока к лаунчеру будет немедленно прекращён.")) return;
     try {
@@ -1111,6 +1141,8 @@ export default function App() {
           {page === "zbt" && (
             <ZbtPage
               campaigns={campaignsWithCounts}
+              zbtEnabled={zbtEnabled}
+              onToggleZbt={setZbtTestingEnabled}
               keys={keys}
               selectedCampaign={selectedCampaign}
               selectCampaign={loadKeys}
@@ -1701,6 +1733,8 @@ function OverviewPage({
 
 function ZbtPage(props: {
   campaigns: Campaign[];
+  zbtEnabled: boolean;
+  onToggleZbt: (enabled: boolean) => void;
   keys: ZbtKey[];
   selectedCampaign: string;
   selectCampaign: (id: string) => void;
@@ -1720,6 +1754,12 @@ function ZbtPage(props: {
           <h2>Кампании и активации ЗБТ ({props.campaigns.length})</h2>
         </div>
         <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          {props.role === "owner" && (
+            <label className="shop-checkbox" style={{ margin: 0 }}>
+              <input type="checkbox" checked={props.zbtEnabled} onChange={(event) => void props.onToggleZbt(event.target.checked)} />
+              Тестирование ЗБТ
+            </label>
+          )}
           <button
             className="button secondary"
             style={{ height: "30px", fontSize: "10px", padding: "0 10px" }}
@@ -1939,6 +1979,7 @@ function PlayersPage(props: {
               <th>КОНТАКТ</th>
               <th>СТАТУС В БАЗЕ</th>
               <th>КАМПАНИЯ</th>
+              <th>СТАТИСТИКА</th>
               <th>ПОСЛЕДНЯЯ АКТИВНОСТЬ</th>
               <th>БЛОКИРОВКА (RTDB /bans)</th>
             </tr>
@@ -1957,6 +1998,7 @@ function PlayersPage(props: {
                     <StatusPill value={player.status || "ACTIVE"} />
                   </td>
                   <td>{player.zbtCampaignId || "—"}</td>
+                  <td>{player.launchCount || 0} запусков<small>{Math.floor((player.totalPlayMinutes || 0) / 60)} ч в игре · {player.lastVersion || "версия не записана"}</small></td>
                   <td>{dateLabel(player.lastSeenAt)}</td>
                   <td>
                     <button
@@ -1971,7 +2013,7 @@ function PlayersPage(props: {
             })}
             {!props.players.length && (
               <tr>
-                <td colSpan={6}>
+                <td colSpan={7}>
                   <EmptyState text="Игроки появятся после первого входа в лаунчер или активации ЗБТ" />
                 </td>
               </tr>
